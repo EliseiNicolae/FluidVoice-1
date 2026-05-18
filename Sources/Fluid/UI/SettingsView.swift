@@ -1386,10 +1386,10 @@ struct SettingsView: View {
                     .padding(16)
                 }
 
-                // Under Development Card
+                // Experimental Card
                 ThemedCard(style: .standard) {
                     VStack(alignment: .leading, spacing: 14) {
-                        Label("Under Development", systemImage: "exclamationmark.triangle")
+                        Label("Experimental (might not work well)", systemImage: "exclamationmark.triangle")
                             .font(.headline)
                             .foregroundStyle(.primary)
 
@@ -1415,7 +1415,15 @@ struct SettingsView: View {
                                 .disabled(self.asr.isRunning)
                             }
 
-                            Text("Experimental. Normal is the safest choice; Fast is for trying even quicker dictation with possible inconsistencies.")
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Try Fast if you want dictation to finish quicker.")
+                                Text("Standard: most reliable and best for everyday dictation.")
+                                Text("Fast: quicker, but may be less consistent.")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                            Text("You can switch back anytime.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
 
