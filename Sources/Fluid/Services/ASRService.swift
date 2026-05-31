@@ -526,6 +526,11 @@ final class ASRService: ObservableObject {
     private let fastPreviewStopGraceMinimumCoverage = 0.72
     private let fastPreviewStopGraceTargetCoverage = 0.88
 
+    /// Keep capturing briefly after stop() is requested so trailing audio — often the last word,
+    /// still in flight from the audio engine when the hotkey is released — lands in the buffer
+    /// before we drain it. Without this, the final word gets cut off (most visible in full-final mode).
+    private let stopTailCaptureNanoseconds: UInt64 = 250_000_000
+
     /// What we did to system media for this recording session, so we can undo it
     /// correctly on stop (resume if we paused, restore volume if we muted).
     private enum ActiveMediaControl { case paused, muted }
@@ -938,6 +943,15 @@ final class ASRService: ObservableObject {
         self.activeMediaControl = nil // Reset for next session
 
         DebugLogger.shared.debug("📍 Preparing final transcription", source: "ASRService")
+
+        // Tail-capture grace: the audio engine delivers samples with some latency, and the hotkey
+        // is usually released right as the last word finishes. Keep recording (engine still running)
+        // for a brief moment so trailing audio lands in the buffer before we drain it — otherwise
+        // the final word is cut off. The fast-preview path has its own streaming grace below; this
+        // covers raw capture for every mode.
+        let bufferedBeforeTailGrace = self.audioBuffer.count
+        try? await Task.sleep(nanoseconds: self.stopTailCaptureNanoseconds)
+        self.benchmarkLog("stop_tail_grace waitedMs=\(Int(self.stopTailCaptureNanoseconds / 1_000_000)) addedSamples=\(self.audioBuffer.count - bufferedBeforeTailGrace)")
 
         DebugLogger.shared.debug("🚫 Setting audioCapturePipeline recording = false...", source: "ASRService")
         self.audioCapturePipeline.setRecordingEnabled(false)
