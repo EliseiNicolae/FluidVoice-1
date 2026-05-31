@@ -2310,6 +2310,7 @@ final class SettingsStore: ObservableObject {
             removeFillerWordsEnabled: self.removeFillerWordsEnabled,
             gaavModeEnabled: self.gaavModeEnabled,
             pauseMediaDuringTranscription: self.pauseMediaDuringTranscription,
+            mediaTranscriptionMode: self.mediaTranscriptionMode,
             vocabularyBoostingEnabled: self.vocabularyBoostingEnabled,
             customDictionaryEntries: self.customDictionaryEntries,
             selectedDictationPromptID: self.selectedDictationPromptID,
@@ -2384,6 +2385,9 @@ final class SettingsStore: ObservableObject {
         self.removeFillerWordsEnabled = payload.removeFillerWordsEnabled
         self.gaavModeEnabled = payload.gaavModeEnabled
         self.pauseMediaDuringTranscription = payload.pauseMediaDuringTranscription
+        if let mediaMode = payload.mediaTranscriptionMode {
+            self.mediaTranscriptionMode = mediaMode
+        }
         self.vocabularyBoostingEnabled = payload.vocabularyBoostingEnabled
         self.customDictionaryEntries = payload.customDictionaryEntries
 
@@ -2798,8 +2802,49 @@ final class SettingsStore: ObservableObject {
 
     // MARK: - Media Playback Control
 
-    /// When enabled, automatically pauses system media playback when transcription starts.
-    /// Only resumes if FluidVoice was the one that paused it.
+    /// How FluidVoice handles currently-playing media while transcription is active.
+    enum MediaTranscriptionMode: String, CaseIterable, Codable, Identifiable {
+        case off
+        case mute
+        case pause
+
+        var id: String { self.rawValue }
+
+        var displayName: String {
+            switch self {
+            case .off: return "Off"
+            case .mute: return "Mute"
+            case .pause: return "Pause"
+            }
+        }
+    }
+
+    /// How to control currently-playing media during transcription (off / mute / pause).
+    ///
+    /// Source of truth for the behavior. Kept in sync with the legacy
+    /// `pauseMediaDuringTranscription` boolean (true whenever this isn't `.off`) so older
+    /// reads and existing backups still reflect the enabled state; when the new key is
+    /// absent we seed the value from that boolean. In every production release the legacy
+    /// toggle PAUSED media, so `true` migrates to `.pause` to preserve existing users'
+    /// behavior (they must opt into `.mute` themselves).
+    var mediaTranscriptionMode: MediaTranscriptionMode {
+        get {
+            if let raw = self.defaults.string(forKey: Keys.mediaTranscriptionMode),
+               let mode = MediaTranscriptionMode(rawValue: raw) {
+                return mode
+            }
+            // Legacy `pauseMediaDuringTranscription == true` always meant "pause" in shipped builds.
+            return self.defaults.bool(forKey: Keys.pauseMediaDuringTranscription) ? .pause : .off
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue.rawValue, forKey: Keys.mediaTranscriptionMode)
+            self.defaults.set(newValue != .off, forKey: Keys.pauseMediaDuringTranscription)
+        }
+    }
+
+    /// Legacy enabled flag for media control during transcription. Retained for backup
+    /// compatibility; `mediaTranscriptionMode` is the source of truth for the behavior.
     var pauseMediaDuringTranscription: Bool {
         get { self.defaults.object(forKey: Keys.pauseMediaDuringTranscription) as? Bool ?? false }
         set {
@@ -3570,6 +3615,7 @@ private extension SettingsStore {
 
         /// Media Playback Control
         static let pauseMediaDuringTranscription = "PauseMediaDuringTranscription"
+        static let mediaTranscriptionMode = "MediaTranscriptionMode"
 
         /// Custom Dictation Prompt
         static let customDictationPrompt = "CustomDictationPrompt"

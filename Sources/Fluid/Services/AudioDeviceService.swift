@@ -115,6 +115,131 @@ enum AudioDevice {
         return self.listAllDevices().first { $0.uid == uid }?.id
     }
 
+    // MARK: - Output Mute
+
+    /// Captures how the default output device was muted, so it can be restored exactly.
+    struct OutputMuteToken {
+        let deviceID: AudioObjectID
+        let restore: Restore
+        let methodDescription: String
+
+        enum Restore {
+            case muteProperty(previous: UInt32)
+            case masterVolume(previous: Float)
+            case channelVolumes([UInt32: Float])
+        }
+    }
+
+    /// Mutes the current default output device using the most reliable method it supports.
+    ///
+    /// Tries, in order: the device Mute property (works on Bluetooth / HDMI / aggregate devices
+    /// that don't expose a settable master volume scalar — e.g. AirPods, Sony WH-1000XM4,
+    /// external displays), then the master volume scalar, then per-channel volume scalars.
+    ///
+    /// - Returns: a token to pass to ``restoreOutput(_:)``, or `nil` if the device can't be muted in software.
+    static func muteDefaultOutput() -> OutputMuteToken? {
+        guard let device = getDefaultOutputDevice() else { return nil }
+        let id = device.id
+
+        // 1. Device Mute property — most broadly supported, including Bluetooth.
+        if let previous = self.getUInt32(id, kAudioDevicePropertyMute, kAudioObjectPropertyElementMain),
+           self.setUInt32(id, kAudioDevicePropertyMute, kAudioObjectPropertyElementMain, 1) {
+            return OutputMuteToken(deviceID: id, restore: .muteProperty(previous: previous), methodDescription: "mute property")
+        }
+
+        // 2. Master volume scalar on the main element.
+        if let previous = self.getScalarVolume(id, kAudioObjectPropertyElementMain),
+           self.setScalarVolume(id, kAudioObjectPropertyElementMain, 0) {
+            return OutputMuteToken(deviceID: id, restore: .masterVolume(previous: previous), methodDescription: "master volume (was \(previous))")
+        }
+
+        // 3. Per-channel volume scalars (many devices only expose channels 1/2, not a main element).
+        var saved: [UInt32: Float] = [:]
+        for channel in UInt32(1) ... UInt32(8) {
+            if let previous = self.getScalarVolume(id, channel), self.setScalarVolume(id, channel, 0) {
+                saved[channel] = previous
+            }
+        }
+        if !saved.isEmpty {
+            return OutputMuteToken(deviceID: id, restore: .channelVolumes(saved), methodDescription: "per-channel volume (\(saved.count) ch)")
+        }
+
+        return nil
+    }
+
+    /// Restores whatever ``muteDefaultOutput()`` changed, targeting the same device it muted.
+    static func restoreOutput(_ token: OutputMuteToken) {
+        switch token.restore {
+        case let .muteProperty(previous):
+            _ = self.setUInt32(token.deviceID, kAudioDevicePropertyMute, kAudioObjectPropertyElementMain, previous)
+        case let .masterVolume(previous):
+            _ = self.setScalarVolume(token.deviceID, kAudioObjectPropertyElementMain, previous)
+        case let .channelVolumes(channels):
+            for (channel, value) in channels {
+                _ = self.setScalarVolume(token.deviceID, channel, value)
+            }
+        }
+    }
+
+    // MARK: Low-level property helpers
+
+    private static func getScalarVolume(_ deviceID: AudioObjectID, _ element: AudioObjectPropertyElement) -> Float? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr ? value : nil
+    }
+
+    @discardableResult
+    private static func setScalarVolume(_ deviceID: AudioObjectID, _ element: AudioObjectPropertyElement, _ value: Float) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard self.isSettable(deviceID, &address) else { return false }
+        var clamped = min(max(value, 0.0), 1.0)
+        let size = UInt32(MemoryLayout<Float32>.size)
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &clamped) == noErr
+    }
+
+    private static func getUInt32(_ deviceID: AudioObjectID, _ selector: AudioObjectPropertySelector, _ element: AudioObjectPropertyElement) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr ? value : nil
+    }
+
+    @discardableResult
+    private static func setUInt32(_ deviceID: AudioObjectID, _ selector: AudioObjectPropertySelector, _ element: AudioObjectPropertyElement, _ value: UInt32) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+        guard self.isSettable(deviceID, &address) else { return false }
+        var mutableValue = value
+        let size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &mutableValue) == noErr
+    }
+
+    private static func isSettable(_ deviceID: AudioObjectID, _ address: inout AudioObjectPropertyAddress) -> Bool {
+        guard AudioObjectHasProperty(deviceID, &address) else { return false }
+        var settable: DarwinBoolean = false
+        guard AudioObjectIsPropertySettable(deviceID, &address, &settable) == noErr else { return false }
+        return settable.boolValue
+    }
+
     private static func getDefaultDeviceId(selector: AudioObjectPropertySelector) -> AudioObjectID? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,

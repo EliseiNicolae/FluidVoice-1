@@ -850,14 +850,28 @@ struct SettingsView: View {
                                     )
                                     Divider().opacity(0.2)
 
-                                    self.optionToggleRow(
-                                        title: "Pause Media During Transcription",
-                                        description: "Automatically pause currently playing audio/video when transcription starts. Resumes only if FluidVoice paused it.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.pauseMediaDuringTranscription },
-                                            set: { SettingsStore.shared.pauseMediaDuringTranscription = $0 }
-                                        )
-                                    )
+                                    HStack(alignment: .center) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Media During Transcription")
+                                                .font(.body)
+                                            Text("When transcribing with media playing, mute or pause it, then restore it afterwards. Mute silences system audio; Pause stops playback. Choose Off to disable.")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+
+                                        Spacer()
+
+                                        Picker("", selection: Binding(
+                                            get: { SettingsStore.shared.mediaTranscriptionMode },
+                                            set: { SettingsStore.shared.mediaTranscriptionMode = $0 }
+                                        )) {
+                                            ForEach(SettingsStore.MediaTranscriptionMode.allCases) { mode in
+                                                Text(mode.displayName).tag(mode)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .frame(width: 170, alignment: .trailing)
+                                    }
                                     Divider().opacity(0.2)
 
                                     self.optionToggleRow(

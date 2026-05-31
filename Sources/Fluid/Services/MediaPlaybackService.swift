@@ -4,16 +4,24 @@ import MediaRemoteAdapter
 #endif
 
 /// Service that wraps MediaRemoteAdapter's MediaController to provide
-/// controlled pause/resume functionality during transcription.
+/// controlled muting during transcription.
 ///
-/// This service ensures we only pause media if it's currently playing,
-/// and only resume if we were the ones who paused it.
+/// Instead of pausing playback, this service mutes the system output volume
+/// while transcription is active (only if media is actually playing) and
+/// restores the previous volume afterwards. This keeps media playing in the
+/// background so it picks up exactly where it was, just silenced.
+///
+/// It only mutes if media is currently playing, and only restores the volume
+/// if we were the ones who muted it.
 @MainActor
 final class MediaPlaybackService {
     static let shared = MediaPlaybackService()
 
     #if arch(arm64)
     private let mediaController = MediaController()
+
+    /// What we changed to mute the output device, used to restore it exactly later.
+    private var outputMuteToken: AudioDevice.OutputMuteToken?
     #endif
 
     private init() {}
@@ -21,16 +29,122 @@ final class MediaPlaybackService {
     // MARK: - Public API
 
     #if arch(arm64)
-    /// Pauses system media playback if something is currently playing.
+    /// Mutes the default output device if media is currently playing.
     ///
-    /// - Returns: `true` if we successfully paused playback, `false` if nothing was playing
-    ///   or if we couldn't determine playback state.
+    /// What was changed is stored so it can be restored via ``unmuteIfWeMuted(_:)``.
+    ///
+    /// - Returns: `true` if we muted the output, `false` if nothing was playing,
+    ///   the playback state couldn't be determined, or the device couldn't be muted.
+    func muteIfMediaPlaying() async -> Bool {
+        let isPlaying = await self.isMediaPlaying()
+
+        guard isPlaying else {
+            DebugLogger.shared.debug(
+                "MediaPlaybackService: Media is not playing, nothing to mute",
+                source: "MediaPlaybackService"
+            )
+            return false
+        }
+
+        // Mute the default output device using whatever method it supports (mute property,
+        // master volume, or per-channel). Bluetooth / HDMI devices often don't expose a
+        // settable master volume scalar, so a plain volume-to-zero isn't enough on its own.
+        guard let token = AudioDevice.muteDefaultOutput() else {
+            DebugLogger.shared.warning(
+                "MediaPlaybackService: Could not mute the output device, skipping mute",
+                source: "MediaPlaybackService"
+            )
+            return false
+        }
+
+        self.outputMuteToken = token
+        DebugLogger.shared.info(
+            "MediaPlaybackService: Media is playing, muted output via \(token.methodDescription)",
+            source: "MediaPlaybackService"
+        )
+        return true
+    }
+
+    /// Restores the output device we muted, but only if we were the ones who muted it.
+    ///
+    /// - Parameter weMuted: `true` if ``muteIfMediaPlaying()`` returned `true` for this session.
+    func unmuteIfWeMuted(_ weMuted: Bool) async {
+        guard weMuted else {
+            DebugLogger.shared.debug(
+                "MediaPlaybackService: We didn't mute, not restoring volume",
+                source: "MediaPlaybackService"
+            )
+            return
+        }
+
+        guard let token = self.outputMuteToken else {
+            DebugLogger.shared.debug(
+                "MediaPlaybackService: No stored mute state to restore",
+                source: "MediaPlaybackService"
+            )
+            return
+        }
+
+        AudioDevice.restoreOutput(token)
+        self.outputMuteToken = nil
+        DebugLogger.shared.info(
+            "MediaPlaybackService: Restored output (\(token.methodDescription))",
+            source: "MediaPlaybackService"
+        )
+    }
+
+    /// Pauses system media playback if media is currently playing.
+    ///
+    /// - Returns: `true` if we sent a pause command, `false` if nothing was playing
+    ///   or the playback state couldn't be determined.
+    func pauseIfPlaying() async -> Bool {
+        let isPlaying = await self.isMediaPlaying()
+
+        guard isPlaying else {
+            DebugLogger.shared.debug(
+                "MediaPlaybackService: Media is not playing, nothing to pause",
+                source: "MediaPlaybackService"
+            )
+            return false
+        }
+
+        self.mediaController.pause()
+        DebugLogger.shared.info(
+            "MediaPlaybackService: Media is playing, sent pause command",
+            source: "MediaPlaybackService"
+        )
+        return true
+    }
+
+    /// Resumes media playback, but only if we were the ones who paused it.
+    ///
+    /// - Parameter wePaused: `true` if ``pauseIfPlaying()`` returned `true` for this session.
+    func resumeIfWePaused(_ wePaused: Bool) async {
+        guard wePaused else {
+            DebugLogger.shared.debug(
+                "MediaPlaybackService: We didn't pause media, not resuming",
+                source: "MediaPlaybackService"
+            )
+            return
+        }
+
+        // Use an explicit play() command — never toggle.
+        self.mediaController.play()
+        DebugLogger.shared.info(
+            "MediaPlaybackService: Resumed media playback (we paused it)",
+            source: "MediaPlaybackService"
+        )
+    }
+
+    // MARK: - Private
+
+    /// Determines whether system media is currently playing.
     ///
     /// - Note: Uses a local one-shot gate to protect against `MediaRemoteAdapter`
     ///   firing the `getTrackInfo` callback more than once, which would otherwise
     ///   crash with `EXC_BREAKPOINT` (SIGTRAP) due to double-resume of a
     ///   `CheckedContinuation`.
-    func pauseIfPlaying() async -> Bool {
+    private func isMediaPlaying() async -> Bool {
         return await withCheckedContinuation { continuation in
             let resumeLock = NSLock()
             var didResume = false
@@ -47,7 +161,7 @@ final class MediaPlaybackService {
 
                 guard shouldResume else {
                     DebugLogger.shared.warning(
-                        "MediaPlaybackService: Suppressed duplicate resume (MediaRemoteAdapter callback fired more than once)",
+                        "MediaPlaybackService: Suppressed duplicate callback (MediaRemoteAdapter callback fired more than once)",
                         source: "MediaPlaybackService"
                     )
                     return
@@ -56,16 +170,11 @@ final class MediaPlaybackService {
                 continuation.resume(returning: value)
             }
 
-            self.mediaController.getTrackInfo { [weak self] trackInfo in
-                guard let self = self else {
-                    resumeOnce(false)
-                    return
-                }
-
+            self.mediaController.getTrackInfo { trackInfo in
                 // If no track info is available, nothing is playing
                 guard let trackInfo = trackInfo else {
                     DebugLogger.shared.debug(
-                        "MediaPlaybackService: No track info available, nothing to pause",
+                        "MediaPlaybackService: No track info available, nothing is playing",
                         source: "MediaPlaybackService"
                     )
                     resumeOnce(false)
@@ -82,7 +191,6 @@ final class MediaPlaybackService {
                     isPlaying = (trackInfo.payload.playbackRate ?? 0.0) > 0.0
                 }
 
-                // Log what we found
                 DebugLogger.shared.debug(
                     """
                     MediaPlaybackService: Track info received
@@ -96,46 +204,24 @@ final class MediaPlaybackService {
                     source: "MediaPlaybackService"
                 )
 
-                if isPlaying {
-                    DebugLogger.shared.info(
-                        "MediaPlaybackService: Media is playing, sending pause command",
-                        source: "MediaPlaybackService"
-                    )
-                    self.mediaController.pause()
-                    resumeOnce(true)
-                } else {
-                    DebugLogger.shared.debug(
-                        "MediaPlaybackService: Media is not playing, no action needed",
-                        source: "MediaPlaybackService"
-                    )
-                    resumeOnce(false)
-                }
+                resumeOnce(isPlaying)
             }
         }
     }
-
-    /// Resumes media playback only if we were the ones who paused it.
-    ///
-    /// - Parameter wePaused: `true` if `pauseIfPlaying()` returned `true` for this session.
-    func resumeIfWePaused(_ wePaused: Bool) async {
-        guard wePaused else {
-            DebugLogger.shared.debug(
-                "MediaPlaybackService: We didn't pause media, not resuming",
-                source: "MediaPlaybackService"
-            )
-            return
-        }
-
-        DebugLogger.shared.info(
-            "MediaPlaybackService: Resuming media playback (we paused it)",
-            source: "MediaPlaybackService"
-        )
-
-        // Use explicit play() command - never toggle
-        self.mediaController.play()
-    }
     #else
     // Intel Mac stub - media control not available
+    func muteIfMediaPlaying() async -> Bool {
+        DebugLogger.shared.debug(
+            "MediaPlaybackService: Not available on Intel Macs",
+            source: "MediaPlaybackService"
+        )
+        return false
+    }
+
+    func unmuteIfWeMuted(_ weMuted: Bool) async {
+        // No-op on Intel
+    }
+
     func pauseIfPlaying() async -> Bool {
         DebugLogger.shared.debug(
             "MediaPlaybackService: Not available on Intel Macs",

@@ -62,6 +62,7 @@ struct SettingsBackupPayload: Codable, Equatable {
     let removeFillerWordsEnabled: Bool
     let gaavModeEnabled: Bool
     let pauseMediaDuringTranscription: Bool
+    let mediaTranscriptionMode: SettingsStore.MediaTranscriptionMode?
     let vocabularyBoostingEnabled: Bool
     let customDictionaryEntries: [SettingsStore.CustomDictionaryEntry]
     let selectedDictationPromptID: String?
