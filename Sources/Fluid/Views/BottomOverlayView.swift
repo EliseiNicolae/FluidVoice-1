@@ -2681,10 +2681,10 @@ struct BottomOverlayView: View {
                     RoundedRectangle(cornerRadius: self.layout.cornerRadius)
                         .fill(Color.black)
                         .shadow(
-                            color: Color.black.opacity(self.isPillSize ? 0.45 : 0),
-                            radius: self.isPillSize ? 12 : 0,
+                            color: Color.black.opacity(self.isPillSize ? 0.32 : 0),
+                            radius: self.isPillSize ? 10 : 0,
                             x: 0,
-                            y: self.isPillSize ? 5 : 0
+                            y: self.isPillSize ? 4 : 0
                         )
 
                     if self.isPillSize {
@@ -2739,7 +2739,7 @@ struct BottomOverlayView: View {
             alignment: .top
         )
         // Reserve space around the pill so its drop shadow isn't clipped by the (content-sized) window.
-        .padding(self.isPillSize ? 18 : 0)
+        .padding(self.isPillSize ? 26 : 0)
         .frame(maxHeight: .infinity, alignment: .top)
         .scaleEffect(self.overlayAnimatedScale, anchor: .center)
         .offset(y: self.overlayAnimatedOffsetY)
