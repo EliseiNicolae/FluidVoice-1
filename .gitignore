@@ -117,7 +117,6 @@ config/secrets.yml
 *.keychain
 *.entitlements.bak
 */*.entitlements.bak
-
 ## Developer-specific Xcode settings (for open source)
 # Each developer should have their own team/bundle ID setup
 Fluid.xcodeproj/project.pbxproj.local
@@ -178,6 +177,9 @@ SettingsStore.xcuserstate
 **/tmp/
 **/temp/
 
+# Asset backups (generated, not needed in repo)
+**/*.appiconset.backup/
+
 
 **/.vscode/
 
@@ -192,7 +194,26 @@ check_downloads.sh
 
 RELEASE_NOTES_*
 .cursor
-**.wav
 
+**.dmg
+**.dmg.zip
 # Documentation backups (for future reference, not needed in repo)
 docs/
+
+
+.agent/
+create_dmg_only.sh
+**.m4a
+!Sources/Fluid/Resources/*.m4a
+# Scratch directory
+scratch/
+
+assets/
+.swiftpm/
+scripts/
+
+**.profraw
+icon_work/
+sample/
+.codex
+builds/

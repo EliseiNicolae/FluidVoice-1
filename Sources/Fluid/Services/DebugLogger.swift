@@ -1,13 +1,35 @@
+import Combine
 import Foundation
 import SwiftUI
-import Combine
 
 class DebugLogger: ObservableObject {
     static let shared = DebugLogger()
-    
+
     @Published var logs: [LogEntry] = []
     private let maxLogs = 1000 // Keep last 1000 log entries
     private let queue = DispatchQueue(label: "debug.logger", qos: .utility)
+
+    // IMPORTANT: Cached setting to avoid circular dependency with SettingsStore
+    // During SettingsStore.init(), if an error is logged, accessing SettingsStore.shared
+    // would cause a recursive dispatch_once deadlock. We use a cached value instead.
+    private var _loggingEnabledCache: Bool?
+    private var loggingEnabled: Bool {
+        if let cached = _loggingEnabledCache {
+            return cached
+        }
+        // Delay access to SettingsStore until after initial singleton setup
+        // Use UserDefaults directly to avoid the circular dependency
+        let defaults = UserDefaults.standard
+        let enabled: Bool
+        if defaults.object(forKey: "EnableDebugLogs") == nil {
+            enabled = true
+        } else {
+            enabled = defaults.bool(forKey: "EnableDebugLogs")
+        }
+        self._loggingEnabledCache = enabled
+        return enabled
+    }
+
     private static let logFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
@@ -15,7 +37,7 @@ class DebugLogger: ObservableObject {
         formatter.timeZone = TimeZone.current
         return formatter
     }()
-    
+
     struct LogEntry: Identifiable, Equatable {
         let id = UUID()
         let timestamp: Date
@@ -32,13 +54,13 @@ class DebugLogger: ObservableObject {
             self.formattedTimestamp = formattedTimestamp
         }
     }
-    
+
     enum LogLevel: String, CaseIterable {
         case info = "INFO"
         case warning = "WARN"
         case error = "ERROR"
         case debug = "DEBUG"
-        
+
         var color: Color {
             switch self {
             case .info: return .blue
@@ -48,29 +70,42 @@ class DebugLogger: ObservableObject {
             }
         }
     }
-    
-    private init() {}
-    
-    func log(_ message: String, level: LogLevel = .info, source: String = "App") {
-        let loggingEnabled = SettingsStore.shared.enableDebugLogs
 
-        queue.async {
+    private init() {}
+
+    /// Refresh the cached logging setting (call after SettingsStore is fully initialized)
+    func refreshLoggingEnabled() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "EnableDebugLogs") == nil {
+            self._loggingEnabledCache = true
+        } else {
+            self._loggingEnabledCache = defaults.bool(forKey: "EnableDebugLogs")
+        }
+    }
+
+    func log(_ message: String, level: LogLevel = .info, source: String = "App") {
+        let loggingEnabled = self.loggingEnabled
+
+        self.queue.async {
             let timestamp = Date()
             let timestampString = Self.logFormatter.string(from: timestamp)
-            let entry: LogEntry? = loggingEnabled
-                ? LogEntry(timestamp: timestamp, level: level, message: message, source: source, formattedTimestamp: timestampString)
-                : nil
-            let formattedLine = entry.map(self.formatLogEntry)
-                ?? self.formatLogLine(timestamp: timestampString, level: level, source: source, message: message)
 
+            let formattedLine = self.formatLogLine(timestamp: timestampString, level: level, source: source, message: message)
+
+            // Always persist diagnostics so issues can be debugged even if UI debug mode is off.
             FileLogger.shared.append(line: formattedLine)
+            print(formattedLine)
 
-            if level == .error || level == .warning || level == .debug {
-                // Also print to console for Xcode debugging
-                print(formattedLine)
-            }
+            // UI log panel still respects the in-app debug toggle.
+            guard loggingEnabled else { return }
 
-            guard let entry = entry else { return }
+            let entry = LogEntry(
+                timestamp: timestamp,
+                level: level,
+                message: message,
+                source: source,
+                formattedTimestamp: timestampString
+            )
 
             DispatchQueue.main.async {
                 self.logs.append(entry)
@@ -85,21 +120,21 @@ class DebugLogger: ObservableObject {
             }
         }
     }
-    
+
     func clear() {
         DispatchQueue.main.async {
             self.logs.removeAll()
         }
     }
-    
+
     func exportLogs() -> String {
-        return logs.map { entry in
-            formatLogEntry(entry)
+        return self.logs.map { entry in
+            self.formatLogEntry(entry)
         }.joined(separator: "\n")
     }
 
     private func formatLogEntry(_ entry: LogEntry) -> String {
-        formatLogLine(timestamp: entry.formattedTimestamp, level: entry.level, source: entry.source, message: entry.message)
+        self.formatLogLine(timestamp: entry.formattedTimestamp, level: entry.level, source: entry.source, message: entry.message)
     }
 
     private func formatLogLine(timestamp: String, level: LogLevel, source: String, message: String) -> String {
@@ -110,18 +145,18 @@ class DebugLogger: ObservableObject {
 // Convenience functions for easier logging
 extension DebugLogger {
     func info(_ message: String, source: String = "App") {
-        log(message, level: .info, source: source)
+        self.log(message, level: .info, source: source)
     }
-    
+
     func warning(_ message: String, source: String = "App") {
-        log(message, level: .warning, source: source)
+        self.log(message, level: .warning, source: source)
     }
-    
+
     func error(_ message: String, source: String = "App") {
-        log(message, level: .error, source: source)
+        self.log(message, level: .error, source: source)
     }
-    
+
     func debug(_ message: String, source: String = "App") {
-        log(message, level: .debug, source: source)
+        self.log(message, level: .debug, source: source)
     }
 }

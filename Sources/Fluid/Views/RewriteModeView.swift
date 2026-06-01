@@ -2,50 +2,66 @@ import SwiftUI
 
 struct RewriteModeView: View {
     @ObservedObject var service: RewriteModeService
-    @ObservedObject var asr: ASRService
+    @EnvironmentObject var appServices: AppServices
+    private var asr: ASRService { self.appServices.asr }
     @ObservedObject var settings = SettingsStore.shared
     @EnvironmentObject var menuBarManager: MenuBarManager
+    @Environment(\.theme) private var theme
     var onClose: (() -> Void)?
-    
+
     @State private var inputText: String = ""
     @State private var showOriginal: Bool = true
     @State private var showHowTo: Bool = false
     @State private var isHoveringHowTo: Bool = false
-    
+    @State private var isThinkingExpanded: Bool = false
+
     // Local state for available models (derived from shared AI Settings pool)
     @State private var availableModels: [String] = []
-    
+
     var body: some View {
         VStack(spacing: 0) {
             // Header - cleaner, just title and close
             HStack {
                 Image(systemName: "pencil.and.outline")
                     .font(.title2)
-                    .foregroundStyle(.blue)
-                Text("Write Mode")
+                    .foregroundStyle(self.theme.palette.accent)
+                Text("Edit Mode")
                     .font(.title2)
                     .fontWeight(.bold)
-                
+
                 Spacer()
-                
-                Button(action: { onClose?() }) {
+
+                Button(action: { self.onClose?() }) {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
             }
             .padding()
-            .background(Color(nsColor: .windowBackgroundColor))
-            
+            .background(self.theme.palette.windowBackground)
+
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                Text("Edit Mode is powered by Custom Prompts.")
+                    .font(.caption)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+            .background(self.theme.palette.windowBackground)
+
             // How To (collapsible)
-            howToSection
-            
+            self.howToSection
+
             Divider()
-            
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     // Original Text Section
-                    if !service.originalText.isEmpty {
+                    if !self.service.originalText.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("Original Text")
@@ -53,20 +69,20 @@ struct RewriteModeView: View {
                                     .fontWeight(.bold)
                                     .foregroundStyle(.secondary)
                                 Spacer()
-                                if !service.rewrittenText.isEmpty {
-                                    Button(showOriginal ? "Hide" : "Show") {
-                                        withAnimation { showOriginal.toggle() }
+                                if !self.service.rewrittenText.isEmpty {
+                                    Button(self.showOriginal ? "Hide" : "Show") {
+                                        withAnimation { self.showOriginal.toggle() }
                                     }
                                     .font(.caption)
                                     .buttonStyle(.link)
                                 }
                             }
-                            
-                            if showOriginal {
-                                Text(service.originalText)
+
+                            if self.showOriginal {
+                                Text(self.service.originalText)
                                     .padding()
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color.gray.opacity(0.1))
+                                    .background(self.theme.palette.cardBackground)
                                     .cornerRadius(8)
                                     .textSelection(.enabled)
                             }
@@ -75,14 +91,14 @@ struct RewriteModeView: View {
                         VStack(spacing: 12) {
                             Image(systemName: "text.bubble")
                                 .font(.system(size: 48))
-                                .foregroundStyle(.teal)
-                            Text("Write Mode")
+                                .foregroundStyle(self.theme.palette.accent)
+                            Text("Edit Mode")
                                 .font(.title2)
                                 .fontWeight(.bold)
                             Text("Ask the AI to write anything for you - emails, replies, summaries, answers, and more.")
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
-                            
+
                             Text("Or select text first to rewrite existing content.")
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
@@ -92,44 +108,46 @@ struct RewriteModeView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 40)
                     }
-                    
+
                     // Rewritten Text Section
-                    if !service.rewrittenText.isEmpty {
+                    if !self.service.rewrittenText.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Rewritten Text")
                                 .font(.caption)
                                 .fontWeight(.bold)
-                                .foregroundStyle(.green)
-                            
-                            Text(service.rewrittenText)
+                                .foregroundStyle(self.theme.palette.accent)
+
+                            Text(self.service.rewrittenText)
                                 .padding()
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color.green.opacity(0.1))
+                                .background(self.theme.palette.accent.opacity(0.1))
                                 .cornerRadius(8)
                                 .textSelection(.enabled)
-                            
+
                             HStack {
                                 Button("Try Again") {
-                                    service.rewrittenText = ""
+                                    self.service.rewrittenText = ""
                                 }
                                 .buttonStyle(.bordered)
-                                
+
                                 Spacer()
-                                
+
                                 Button("Replace Original") {
-                                    service.acceptRewrite()
-                                    onClose?()
+                                    self.service.acceptRewrite()
+                                    self.onClose?()
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .tint(.green)
+                                .tint(self.theme.palette.accent)
                             }
                             .padding(.top, 8)
                         }
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
-                    
+
                     // Conversation History (optional, maybe just last error)
-                    if let lastMsg = service.conversationHistory.last, lastMsg.role == .assistant, service.rewrittenText.isEmpty {
+                    if let lastMsg = service.conversationHistory.last, lastMsg.role == .assistant,
+                       service.rewrittenText.isEmpty
+                    {
                         Text(lastMsg.content) // Error message usually
                             .foregroundStyle(.red)
                             .padding()
@@ -139,245 +157,233 @@ struct RewriteModeView: View {
                 }
                 .padding()
             }
-            
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(self.theme.palette.cardBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(self.theme.palette.cardBorder.opacity(0.45), lineWidth: 1)
+                    )
+            )
+
             Divider()
-            
+
             // Input Area with model selectors inline
             HStack(spacing: 8) {
-                // Provider Selector (compact)
-                Picker("", selection: $settings.rewriteModeSelectedProviderID) {
-                    Text("OpenAI").tag("openai")
-                    Text("Groq").tag("groq")
-                    
-                    // Apple Intelligence
-                    if AppleIntelligenceService.isAvailable {
-                        Text("Apple Intelligence").tag("apple-intelligence")
-                    } else {
-                        Text("Apple Intelligence (Unavailable)")
-                            .foregroundColor(.secondary)
-                            .tag("apple-intelligence-disabled")
-                    }
-                    
-                    ForEach(settings.savedProviders) { provider in
-                        Text(provider.name).tag(provider.id)
-                    }
-                }
-                .frame(width: 110)
-                .onChange(of: settings.rewriteModeSelectedProviderID) { newValue in
-                    // Prevent selecting disabled Apple Intelligence
-                    if newValue == "apple-intelligence-disabled" {
-                        settings.rewriteModeSelectedProviderID = "openai"
-                    }
-                    updateAvailableModels()
-                }
-                
-                // Model Selector (hidden for Apple Intelligence)
-                if settings.rewriteModeSelectedProviderID != "apple-intelligence" {
-                    Picker("", selection: Binding(
-                        get: { settings.rewriteModeSelectedModel ?? availableModels.first ?? "gpt-4o" },
-                        set: { settings.rewriteModeSelectedModel = $0 }
-                    )) {
-                        ForEach(availableModels, id: \.self) { model in
-                            Text(model).tag(model)
+                // Provider Selector (compact, searchable)
+                SearchableProviderPicker(
+                    builtInProviders: self.builtInProvidersList,
+                    savedProviders: self.settings.savedProviders,
+                    selectedProviderID: Binding(
+                        get: { self.settings.rewriteModeSelectedProviderID },
+                        set: { newValue in
+                            // Prevent selecting disabled Apple Intelligence
+                            if newValue == "apple-intelligence-disabled" {
+                                self.settings.rewriteModeSelectedProviderID = "openai"
+                            } else {
+                                self.settings.rewriteModeSelectedProviderID = newValue
+                            }
+                            self.updateAvailableModels()
                         }
-                    }
-                    .frame(width: 130)
+                    )
+                )
+
+                // Model Selector (hidden for Apple Intelligence)
+                if self.settings.rewriteModeSelectedProviderID != "apple-intelligence" {
+                    SearchableModelPicker(
+                        models: self.availableModels,
+                        selectedModel: Binding(
+                            get: { self.settings.rewriteModeSelectedModel ?? self.availableModels.first ?? "" },
+                            set: { self.settings.rewriteModeSelectedModel = $0 }
+                        ),
+                        onRefresh: nil,
+                        isRefreshing: false
+                    )
                 }
-                
+
                 // Input field (flexible)
-                TextField(service.originalText.isEmpty 
-                    ? "Ask me to write anything..." 
-                    : "How should I rewrite this?", 
-                    text: $inputText)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(submitRequest)
-                
-                Button(action: submitRequest) {
+                TextField(
+                    self.service.originalText.isEmpty
+                        ? "Ask me to write or edit..."
+                        : "How should I edit this?",
+                    text: self.$inputText
+                )
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(self.submitRequest)
+
+                Button(action: self.submitRequest) {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
                 }
                 .buttonStyle(.plain)
-                .disabled(inputText.isEmpty || service.isProcessing)
-                
+                .disabled(self.inputText.isEmpty || self.service.isProcessing)
+
                 // Voice Input
-                Button(action: toggleRecording) {
-                    Image(systemName: asr.isRunning ? "stop.circle.fill" : "mic.circle.fill")
+                Button(action: self.toggleRecording) {
+                    Image(systemName: self.asr.isRunning ? "stop.circle.fill" : "mic.circle.fill")
                         .font(.title2)
-                        .foregroundStyle(asr.isRunning ? Color.red : Color.accentColor)
+                        .foregroundStyle(self.asr.isRunning ? Color.red : self.theme.palette.accent)
                 }
                 .buttonStyle(.plain)
-                
-                if service.isProcessing {
+
+                if self.service.isProcessing {
                     ProgressView()
                         .controlSize(.small)
+                        .fixedSize()
                 }
             }
             .padding()
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(self.theme.palette.windowBackground)
+
+            // Thinking view (real-time, during processing)
+            if self.service.isProcessing && self.settings.showThinkingTokens && !self.service.streamingThinkingText.isEmpty {
+                self.thinkingView
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+            }
         }
-        .onChange(of: asr.finalText) { newText in
+        .onChange(of: self.asr.finalText) { _, newText in
             if !newText.isEmpty {
-                inputText = newText
+                self.inputText = newText
             }
         }
         .onExitCommand {
-            onClose?()
+            self.onClose?()
         }
         .onAppear {
             // Note: Overlay mode is now set centrally by ContentView.handleModeTransition()
-            updateAvailableModels()
+            self.updateAvailableModels()
         }
         // Note: onDisappear overlay mode handling removed - now handled centrally by ContentView
     }
-    
+
     private func toggleRecording() {
-        if asr.isRunning {
-            Task { await asr.stop() }
+        if self.asr.isRunning {
+            Task { await self.asr.stop() }
         } else {
-            asr.start()
+            Task { await self.asr.start() }
         }
     }
-    
+
     private func submitRequest() {
-        guard !inputText.isEmpty else { return }
-        let prompt = inputText
-        inputText = ""
+        guard !self.inputText.isEmpty else { return }
+        let prompt = self.inputText
+        self.inputText = ""
         Task {
-            await service.processRewriteRequest(prompt)
+            await self.service.processRewriteRequest(prompt)
         }
     }
-    
+
     // MARK: - Model Management (pulls from shared AI Settings pool)
-    
+
     private func updateAvailableModels() {
-        let currentProviderID = settings.rewriteModeSelectedProviderID
-        let currentModel = settings.rewriteModeSelectedModel ?? "gpt-4o"
-        
+        let currentProviderID = self.settings.rewriteModeSelectedProviderID
+        let currentModel = self.settings.rewriteModeSelectedModel ?? "gpt-4.1"
+
         // Apple Intelligence has only one model
         if currentProviderID == "apple-intelligence" {
-            availableModels = ["System Model"]
+            self.availableModels = ["System Model"]
             return
         }
-        
+
         // Pull models from the shared pool configured in AI Settings
-        let possibleKeys = providerKeys(for: currentProviderID)
+        let possibleKeys = self.providerKeys(for: currentProviderID)
         let storedList = possibleKeys.lazy
             .compactMap { SettingsStore.shared.availableModelsByProvider[$0] }
             .first { !$0.isEmpty }
-        
+
         if let stored = storedList {
-            availableModels = stored
+            self.availableModels = stored
         } else {
-            availableModels = defaultModels(for: currentProviderID)
+            self.availableModels = ModelRepository.shared.defaultModels(for: currentProviderID)
         }
-        
+
         // If current model not in list, select first available
-        if !availableModels.contains(currentModel) {
-            settings.rewriteModeSelectedModel = availableModels.first ?? "gpt-4o"
+        if !self.availableModels.contains(currentModel) {
+            self.settings.rewriteModeSelectedModel = self.availableModels.first ?? "gpt-4.1"
         }
     }
-    
+
     private func providerKeys(for providerID: String) -> [String] {
-        var keys: [String] = []
-        let trimmed = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        if trimmed.isEmpty {
-            return [providerID]
-        }
-        
-        if trimmed == "openai" || trimmed == "groq" {
-            return [trimmed]
-        }
-        
-        if trimmed.hasPrefix("custom:") {
-            keys.append(trimmed)
-            keys.append(String(trimmed.dropFirst("custom:".count)))
-        } else {
-            keys.append("custom:\(trimmed)")
-            keys.append(trimmed)
-        }
-        
-        return Array(Set(keys))
+        return ModelRepository.shared.providerKeys(for: providerID)
     }
-    
-    private func defaultModels(for provider: String) -> [String] {
-        switch provider {
-        case "openai": return ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
-        case "groq": return ["llama-3.3-70b-versatile", "llama3-70b-8192", "mixtral-8x7b-32768"]
-        case "apple-intelligence": return ["System Model"]
-        default: return ["gpt-4o"]
-        }
+
+    private var builtInProvidersList: [(id: String, name: String)] {
+        ModelRepository.shared.builtInProvidersList(
+            includeAppleIntelligence: true,
+            appleIntelligenceAvailable: AppleIntelligenceService.isAvailable
+        )
     }
-    
-    // MARK: - How To Section
-    
+
     private var shortcutDisplay: String {
-        settings.rewriteModeHotkeyShortcut.displayString
+        self.settings.rewriteModeHotkeyShortcut.displayString
     }
-    
+
     private var howToSection: some View {
         VStack(spacing: 0) {
             // Toggle button with hover effect
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showHowTo.toggle() } }) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { self.showHowTo.toggle() } }) {
                 HStack {
                     Image(systemName: "questionmark.circle")
                         .font(.caption)
                     Text("How to use")
                         .font(.caption)
                     Spacer()
-                    Image(systemName: showHowTo ? "chevron.up" : "chevron.down")
+                    Image(systemName: self.showHowTo ? "chevron.up" : "chevron.down")
                         .font(.caption2)
                 }
-                .foregroundStyle(isHoveringHowTo ? .primary : .secondary)
+                .foregroundStyle(self.isHoveringHowTo ? .primary : .secondary)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(isHoveringHowTo ? Color.primary.opacity(0.05) : Color.clear)
+                .background(self.isHoveringHowTo ? Color.primary.opacity(0.05) : Color.clear)
                 .cornerRadius(4)
             }
             .buttonStyle(.plain)
             .onHover { hovering in
-                withAnimation(.easeInOut(duration: 0.15)) { isHoveringHowTo = hovering }
+                withAnimation(.easeInOut(duration: 0.15)) { self.isHoveringHowTo = hovering }
             }
-            
-            if showHowTo {
+
+            if self.showHowTo {
                 VStack(alignment: .leading, spacing: 12) {
-                    // Write fresh
+                    // Create new text
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("To Write Fresh")
+                        Text("Create New Text")
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundStyle(.secondary)
-                        
+
                         HStack(spacing: 4) {
                             Text("Press")
                                 .font(.caption)
-                            Text(shortcutDisplay)
+                            Text(self.shortcutDisplay)
                                 .font(.caption)
                                 .fontWeight(.medium)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color.primary.opacity(0.1))
+                                .background(self.theme.palette.cardBackground.opacity(0.8))
                                 .cornerRadius(4)
                             Text("and speak what you want to write.")
                                 .font(.caption)
                         }
                         .foregroundStyle(.primary.opacity(0.8))
-                        
-                        howToItem("\"Write an email asking for time off\"")
-                        howToItem("\"Draft a thank you note\"")
+
+                        self.howToItem("\"Write an email asking for time off\"")
+                        self.howToItem("\"Draft a thank you note\"")
                     }
-                    
-                    // Rewrite
+
+                    // Edit selected text
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("To Rewrite/Edit")
+                        Text("Edit Selected Text")
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundStyle(.secondary)
-                        
+
                         HStack(spacing: 4) {
                             Text("Select text first, then press")
                                 .font(.caption)
-                            Text(shortcutDisplay)
+                            Text(self.shortcutDisplay)
                                 .font(.caption)
                                 .fontWeight(.medium)
                                 .padding(.horizontal, 6)
@@ -388,10 +394,10 @@ struct RewriteModeView: View {
                                 .font(.caption)
                         }
                         .foregroundStyle(.primary.opacity(0.8))
-                        
-                        howToItem("\"Make this more formal\"")
-                        howToItem("\"Fix grammar and spelling\"")
-                        howToItem("\"Summarize this\"")
+
+                        self.howToItem("\"Make this more formal\"")
+                        self.howToItem("\"Fix grammar and spelling\"")
+                        self.howToItem("\"Summarize this\"")
                     }
                 }
                 .padding(.horizontal, 16)
@@ -399,9 +405,9 @@ struct RewriteModeView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.5))
+        .background(self.theme.palette.contentBackground)
     }
-    
+
     private func howToItem(_ text: String) -> some View {
         HStack(spacing: 6) {
             Text("•")
@@ -410,5 +416,53 @@ struct RewriteModeView: View {
                 .font(.caption)
                 .foregroundStyle(.primary.opacity(0.8))
         }
+    }
+
+    // MARK: - Thinking View (Cursor-style shimmer)
+
+    private var thinkingView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header with shimmer effect - tap to expand/collapse
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { self.isThinkingExpanded.toggle() } }) {
+                HStack(spacing: 8) {
+                    CommandShimmerText(text: "Thinking")
+
+                    Spacer()
+
+                    Image(systemName: self.isThinkingExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.6))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .buttonStyle(.plain)
+
+            // Expanded content
+            if self.isThinkingExpanded {
+                ScrollView(.vertical, showsIndicators: true) {
+                    Text(self.service.streamingThinkingText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 10)
+                }
+                .frame(maxHeight: 150)
+            } else {
+                // Preview - first 100 chars
+                if !self.service.streamingThinkingText.isEmpty {
+                    Text(String(self.service.streamingThinkingText.prefix(100)) + (self.service.streamingThinkingText.count > 100 ? "..." : ""))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary.opacity(0.7))
+                        .lineLimit(2)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                }
+            }
+        }
+        .background(self.theme.palette.cardBackground.opacity(0.9))
+        .cornerRadius(8)
     }
 }

@@ -84,38 +84,42 @@ struct AppTheme {
     let materials: Materials
 
     /// Default dark-forward theme tuned for macOS Sonoma / Sequoia aesthetics.
-    static let dark = AppTheme(
-        palette: Palette(
-            windowBackground: Color(red: 0.08, green: 0.08, blue: 0.08),
-            contentBackground: Color(red: 0.10, green: 0.10, blue: 0.10),
-            sidebarBackground: Color(red: 0.06, green: 0.06, blue: 0.06),
-            cardBackground: Color(red: 0.12, green: 0.12, blue: 0.12),
-            elevatedCardBackground: Color(red: 0.14, green: 0.14, blue: 0.14),
-            toolbarBackground: Color(red: 0.09, green: 0.09, blue: 0.09),
-            cardBorder: Color(nsColor: .separatorColor).opacity(0.25),
-            separator: Color(nsColor: .separatorColor).opacity(0.4),
-            primaryText: Color(nsColor: .labelColor),
-            secondaryText: Color(nsColor: .secondaryLabelColor),
-            tertiaryText: Color(nsColor: .tertiaryLabelColor),
-            accent: Color(red: 0.20, green: 0.85, blue: 0.50),
-            warning: Color(nsColor: .systemOrange),
-            success: Color(nsColor: .systemGreen)
-        ),
-        metrics: Metrics(
-            spacing: .standard,
-            corners: .standard,
-            cardShadow: .subtle(color: .black, opacity: 0.70),
-            elevatedCardShadow: .subtle(color: .black, opacity: 0.80)
-        ),
-        materials: Materials(
-            window: .thinMaterial,
-            sidebar: .ultraThinMaterial,
-            card: .thinMaterial,
-            elevatedCard: .regularMaterial,
-            toolbar: .ultraThinMaterial
+    static func dark(accent: Color) -> AppTheme {
+        AppTheme(
+            palette: Palette(
+                windowBackground: Color(red: 0.07, green: 0.07, blue: 0.07),
+                contentBackground: Color(red: 0.09, green: 0.09, blue: 0.09),
+                sidebarBackground: Color(red: 0.06, green: 0.06, blue: 0.06),
+                cardBackground: Color(red: 0.08, green: 0.08, blue: 0.08),
+                elevatedCardBackground: Color(red: 0.11, green: 0.11, blue: 0.11),
+                toolbarBackground: Color(red: 0.06, green: 0.06, blue: 0.06),
+
+                cardBorder: Color.white.opacity(0.10),
+                separator: Color.white.opacity(0.16),
+                primaryText: Color(nsColor: .labelColor),
+                secondaryText: Color(nsColor: .secondaryLabelColor),
+                tertiaryText: Color(nsColor: .tertiaryLabelColor),
+                accent: accent,
+                warning: Color(nsColor: .systemOrange),
+                success: accent
+            ),
+            metrics: Metrics(
+                spacing: .standard,
+                corners: .standard,
+                cardShadow: .subtle(color: .black, opacity: 0.70),
+                elevatedCardShadow: .subtle(color: .black, opacity: 0.80)
+            ),
+            materials: Materials(
+                window: .thinMaterial,
+                sidebar: .ultraThinMaterial,
+                card: .thinMaterial,
+                elevatedCard: .regularMaterial,
+                toolbar: .ultraThinMaterial
+            )
         )
-    )
+    }
+
+    static let dark = AppTheme.dark(accent: .fluidGreen)
 }
 
 // MARK: - Helpers
-

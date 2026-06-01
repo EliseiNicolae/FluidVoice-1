@@ -1,5 +1,5 @@
-import Foundation
 import Combine
+import Foundation
 
 @MainActor
 final class CommandModeService: ObservableObject {
@@ -7,43 +7,51 @@ final class CommandModeService: ObservableObject {
     @Published var isProcessing = false
     @Published var pendingCommand: PendingCommand? = nil
     @Published var currentStep: AgentStep? = nil
-    @Published var streamingText: String = ""  // Real-time streaming text for UI
+    @Published var streamingText: String = "" // Real-time streaming text for UI
+    @Published var streamingThinkingText: String = "" // Real-time thinking tokens for UI
     @Published private(set) var currentChatID: String?
-    
+
     private let terminalService = TerminalService()
     private let chatStore = ChatHistoryStore.shared
     private var currentTurnCount = 0
     private let maxTurns = 20
-    
+    private var didRequireConfirmationThisRun: Bool = false
+
     // Flag to enable notch output display
     var enableNotchOutput: Bool = true
-    
+
     // Streaming UI update throttling - adaptive rate based on content length
     private var lastUIUpdate: CFAbsoluteTime = 0
-    private var streamingBuffer: [String] = []  // Buffer tokens instead of string concat
-    
+    private var lastThinkingUIUpdate: CFAbsoluteTime = 0
+    private var streamingBuffer: [String] = [] // Buffer tokens instead of string concat
+    private var thinkingBuffer: [String] = [] // Buffer thinking tokens
+
     // MARK: - Initialization
-    
+
     init() {
         // Load current chat from store
-        loadCurrentChatFromStore()
+        self.loadCurrentChatFromStore()
     }
-    
+
+    private var shouldSyncCommandNotchState: Bool {
+        self.enableNotchOutput && NotchOverlayManager.shared.shouldSyncCommandConversationToNotch
+    }
+
     private func loadCurrentChatFromStore() {
         if let session = chatStore.currentSession {
-            currentChatID = session.id
-            conversationHistory = session.messages.map { chatMessageToMessage($0) }
-            syncToNotchState()
+            self.currentChatID = session.id
+            self.conversationHistory = session.messages.map { self.chatMessageToMessage($0) }
+            self.syncToNotchState()
         } else {
             // Create new chat if none exists
-            let newSession = chatStore.createNewChat()
-            currentChatID = newSession.id
-            conversationHistory = []
+            let newSession = self.chatStore.createNewChat()
+            self.currentChatID = newSession.id
+            self.conversationHistory = []
         }
     }
-    
+
     // MARK: - Agent Step Tracking
-    
+
     enum AgentStep: Equatable {
         case thinking(String)
         case checking(String)
@@ -51,149 +59,151 @@ final class CommandModeService: ObservableObject {
         case verifying(String)
         case completed(Bool)
     }
-    
+
     // MARK: - Models
-    
+
     struct Message: Identifiable, Equatable {
         let id = UUID()
         let role: Role
         let content: String
+        let thinking: String? // Display-only: AI reasoning tokens (NOT sent to API)
         let toolCall: ToolCall?
         let stepType: StepType
         let timestamp: Date
-        
+
         enum Role: Equatable {
             case user
             case assistant
             case tool
         }
-        
+
         enum StepType: Equatable {
             case normal
-            case thinking      // AI reasoning
-            case checking      // Pre-flight verification
-            case executing     // Running command
-            case verifying     // Post-action check
-            case success       // Action completed
-            case failure       // Action failed
+            case thinking // AI reasoning
+            case checking // Pre-flight verification
+            case executing // Running command
+            case verifying // Post-action check
+            case success // Action completed
+            case failure // Action failed
         }
-        
+
         struct ToolCall: Equatable {
             let id: String
             let command: String
             let workingDirectory: String?
-            let purpose: String?  // Why this command is being run
+            let purpose: String? // Why this command is being run
         }
-        
-        init(role: Role, content: String, toolCall: ToolCall? = nil, stepType: StepType = .normal) {
+
+        init(role: Role, content: String, thinking: String? = nil, toolCall: ToolCall? = nil, stepType: StepType = .normal) {
             self.role = role
             self.content = content
+            self.thinking = thinking
             self.toolCall = toolCall
             self.stepType = stepType
             self.timestamp = Date()
         }
     }
-    
+
     struct PendingCommand {
         let id: String
         let command: String
         let workingDirectory: String?
         let purpose: String?
     }
-    
+
     // MARK: - Public Methods
-    
+
     func clearHistory() {
-        conversationHistory.removeAll()
-        pendingCommand = nil
-        currentTurnCount = 0
-        
+        self.conversationHistory.removeAll()
+        self.pendingCommand = nil
+        self.currentTurnCount = 0
+
         // Clear in store as well
-        chatStore.clearCurrentChat()
-        
+        self.chatStore.clearCurrentChat()
+
         // Also clear notch state
         NotchContentState.shared.clearCommandOutput()
     }
-    
+
     // MARK: - Chat Management
-    
+
     /// Get recent chats for dropdown
     func getRecentChats() -> [ChatSession] {
-        return chatStore.getRecentChats(excludingCurrent: false)
+        return self.chatStore.getRecentChats(excludingCurrent: false)
     }
-    
+
     /// Create a new chat and switch to it
     func createNewChat() {
         // Can't switch while processing
-        guard !isProcessing else { return }
-        
+        guard !self.isProcessing else { return }
+
         // Save current chat first
-        saveCurrentChat()
-        
+        self.saveCurrentChat()
+
         // Create new
-        let newSession = chatStore.createNewChat()
-        currentChatID = newSession.id
-        conversationHistory = []
-        pendingCommand = nil
-        currentTurnCount = 0
-        currentStep = nil
-        
+        let newSession = self.chatStore.createNewChat()
+        self.currentChatID = newSession.id
+        self.conversationHistory = []
+        self.pendingCommand = nil
+        self.currentTurnCount = 0
+        self.currentStep = nil
+
         // Clear notch state
         NotchContentState.shared.clearCommandOutput()
         NotchContentState.shared.refreshRecentChats()
     }
-    
+
     /// Switch to a different chat by ID
     /// Returns false if switching is blocked (e.g., during processing)
     @discardableResult
     func switchToChat(id: String) -> Bool {
         // Can't switch while processing
-        guard !isProcessing else { return false }
-        
+        guard !self.isProcessing else { return false }
+
         // Don't switch to current
-        guard id != currentChatID else { return true }
-        
+        guard id != self.currentChatID else { return true }
+
         // Save current chat first
-        saveCurrentChat()
-        
+        self.saveCurrentChat()
+
         // Load the target chat
         guard let session = chatStore.switchToChat(id: id) else { return false }
-        
-        currentChatID = session.id
-        conversationHistory = session.messages.map { chatMessageToMessage($0) }
-        pendingCommand = nil
-        currentTurnCount = 0
-        currentStep = nil
-        
+
+        self.currentChatID = session.id
+        self.conversationHistory = session.messages.map { self.chatMessageToMessage($0) }
+        self.pendingCommand = nil
+        self.currentTurnCount = 0
+        self.currentStep = nil
+
         // Sync to notch state
-        syncToNotchState()
+        self.syncToNotchState()
         NotchContentState.shared.refreshRecentChats()
-        
+
         return true
     }
-    
+
     /// Delete current chat and switch to next
     func deleteCurrentChat() {
         // Can't delete while processing
-        guard !isProcessing else { return }
-        
-        chatStore.deleteCurrentChat()
-        
+        guard !self.isProcessing else { return }
+
+        self.chatStore.deleteCurrentChat()
+
         // Load the new current chat
-        loadCurrentChatFromStore()
+        self.loadCurrentChatFromStore()
         NotchContentState.shared.refreshRecentChats()
     }
-    
+
     /// Save current conversation to store
     func saveCurrentChat() {
-        guard let chatID = currentChatID else { return }
-        
-        let messages = conversationHistory.map { messageToChatMessage($0) }
-        chatStore.updateCurrentChat(messages: messages)
+        guard self.currentChatID != nil else { return }
+
+        let messages = self.conversationHistory.map { self.messageToChatMessage($0) }
+        self.chatStore.updateCurrentChat(messages: messages)
     }
-    
+
     // MARK: - Conversion Helpers
-    
+
     private func messageToChatMessage(_ msg: Message) -> ChatMessage {
         let role: ChatMessage.Role
         switch msg.role {
@@ -201,7 +211,7 @@ final class CommandModeService: ObservableObject {
         case .assistant: role = .assistant
         case .tool: role = .tool
         }
-        
+
         let stepType: ChatMessage.StepType
         switch msg.stepType {
         case .normal: stepType = .normal
@@ -212,7 +222,7 @@ final class CommandModeService: ObservableObject {
         case .success: stepType = .success
         case .failure: stepType = .failure
         }
-        
+
         var toolCall: ChatMessage.ToolCall? = nil
         if let tc = msg.toolCall {
             toolCall = ChatMessage.ToolCall(
@@ -222,7 +232,7 @@ final class CommandModeService: ObservableObject {
                 purpose: tc.purpose
             )
         }
-        
+
         return ChatMessage(
             id: msg.id,
             role: role,
@@ -232,7 +242,7 @@ final class CommandModeService: ObservableObject {
             timestamp: msg.timestamp
         )
     }
-    
+
     private func chatMessageToMessage(_ chatMsg: ChatMessage) -> Message {
         let role: Message.Role
         switch chatMsg.role {
@@ -240,7 +250,7 @@ final class CommandModeService: ObservableObject {
         case .assistant: role = .assistant
         case .tool: role = .tool
         }
-        
+
         let stepType: Message.StepType
         switch chatMsg.stepType {
         case .normal: stepType = .normal
@@ -251,7 +261,7 @@ final class CommandModeService: ObservableObject {
         case .success: stepType = .success
         case .failure: stepType = .failure
         }
-        
+
         var toolCall: Message.ToolCall? = nil
         if let tc = chatMsg.toolCall {
             toolCall = Message.ToolCall(
@@ -261,7 +271,7 @@ final class CommandModeService: ObservableObject {
                 purpose: tc.purpose
             )
         }
-        
+
         return Message(
             role: role,
             content: chatMsg.content,
@@ -269,246 +279,309 @@ final class CommandModeService: ObservableObject {
             stepType: stepType
         )
     }
-    
+
     /// Sync conversation history to NotchContentState
     private func syncToNotchState() {
+        guard self.shouldSyncCommandNotchState else {
+            return
+        }
+
         NotchContentState.shared.clearCommandOutput()
-        
-        for msg in conversationHistory {
+
+        for msg in self.conversationHistory {
             let role: NotchContentState.CommandOutputMessage.Role
             switch msg.role {
             case .user: role = .user
             case .assistant: role = .assistant
-            case .tool: role = .status  // Tool outputs shown as status in notch
+            case .tool: role = .status // Tool outputs shown as status in notch
             }
-            
+
             // Skip tool outputs in notch (they're verbose)
             if msg.role == .tool { continue }
-            
+
             NotchContentState.shared.addCommandMessage(role: role, content: msg.content)
         }
     }
-    
+
     /// Process user voice/text command
-    func processUserCommand(_ text: String) async {
+    func processUserCommand(_ text: String, notifyInvalidRequest: Bool = false) async {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        
-        isProcessing = true
-        currentTurnCount = 0
-        conversationHistory.append(Message(role: .user, content: text))
-        
+
+        self.isProcessing = true
+        self.currentTurnCount = 0
+        self.didRequireConfirmationThisRun = false
+        self.conversationHistory.append(Message(role: .user, content: text))
+
         // Auto-save after adding user message
-        saveCurrentChat()
-        
+        self.saveCurrentChat()
+
         // Push to notch
-        if enableNotchOutput {
+        if self.shouldSyncCommandNotchState {
             NotchContentState.shared.addCommandMessage(role: .user, content: text)
             NotchContentState.shared.setCommandProcessing(true)
         }
-        
-        await processNextTurn()
+
+        await self.processNextTurn(notifyInvalidRequest: notifyInvalidRequest)
     }
-    
+
     /// Process follow-up command from notch input
     func processFollowUpCommand(_ text: String) async {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        
+
         // Add to both histories
-        conversationHistory.append(Message(role: .user, content: text))
-        NotchContentState.shared.addCommandMessage(role: .user, content: text)
-        
+        self.conversationHistory.append(Message(role: .user, content: text))
+        if self.shouldSyncCommandNotchState {
+            NotchContentState.shared.addCommandMessage(role: .user, content: text)
+        }
+
         // Auto-save after adding user message
-        saveCurrentChat()
-        
-        isProcessing = true
-        NotchContentState.shared.setCommandProcessing(true)
-        
-        await processNextTurn()
+        self.saveCurrentChat()
+
+        self.isProcessing = true
+        self.didRequireConfirmationThisRun = false
+        if self.shouldSyncCommandNotchState {
+            NotchContentState.shared.setCommandProcessing(true)
+        }
+
+        await self.processNextTurn()
     }
-    
+
     /// Execute pending command (after user confirmation)
     func confirmAndExecute() async {
         guard let pending = pendingCommand else { return }
-        pendingCommand = nil
-        isProcessing = true
-        
-        await executeCommand(pending.command, workingDirectory: pending.workingDirectory, callId: pending.id)
+        self.pendingCommand = nil
+        self.isProcessing = true
+
+        await self.executeCommand(pending.command, workingDirectory: pending.workingDirectory, callId: pending.id)
     }
-    
+
     /// Cancel pending command
     func cancelPendingCommand() {
-        pendingCommand = nil
-        conversationHistory.append(Message(
+        self.pendingCommand = nil
+        self.conversationHistory.append(Message(
             role: .assistant,
             content: "Command cancelled.",
             stepType: .failure
         ))
-        isProcessing = false
-        currentStep = nil
+        self.isProcessing = false
+        self.currentStep = nil
     }
-    
+
     // MARK: - Agent Loop
-    
-    private func processNextTurn() async {
-        if currentTurnCount >= maxTurns {
+
+    private func processNextTurn(notifyInvalidRequest: Bool = false) async {
+        if self.currentTurnCount >= self.maxTurns {
             let errorMsg = "Reached maximum steps limit. Please review the progress and continue if needed."
-            conversationHistory.append(Message(
+            self.conversationHistory.append(Message(
                 role: .assistant,
                 content: errorMsg,
                 stepType: .failure
             ))
-            isProcessing = false
-            currentStep = .completed(false)
-            
+            self.isProcessing = false
+            self.currentStep = .completed(false)
+
             // Auto-save on completion
-            saveCurrentChat()
-            
+            self.saveCurrentChat()
+
+            self.captureCommandRunCompleted(success: false)
+
             // Push to notch
-            if enableNotchOutput {
+            if self.shouldSyncCommandNotchState {
                 NotchContentState.shared.addCommandMessage(role: .assistant, content: errorMsg)
                 NotchContentState.shared.setCommandProcessing(false)
-                showExpandedNotchIfNeeded()
+                self.showExpandedNotchIfNeeded()
             }
             return
         }
-        
-        currentTurnCount += 1
-        currentStep = .thinking("Analyzing...")
-        
+
+        self.currentTurnCount += 1
+        self.currentStep = .thinking("Analyzing...")
+
         // Push status to notch
-        if enableNotchOutput {
+        if self.shouldSyncCommandNotchState {
             NotchContentState.shared.addCommandMessage(role: .status, content: "Thinking...")
         }
-        
+
         do {
             let response = try await callLLM()
-            
+
             if let tc = response.toolCall {
                 // Determine step type based on command purpose
-                let stepType = determineStepType(for: tc.command, purpose: tc.purpose)
-                currentStep = stepType == .checking ? .checking(tc.command) : .executing(tc.command)
-                
-                // AI wants to run a command
-                conversationHistory.append(Message(
+                let stepType = self.determineStepType(for: tc.command, purpose: tc.purpose)
+                self.currentStep = stepType == .checking ? .checking(tc.command) : .executing(tc.command)
+
+                // AI wants to run a command - include thinking for display
+                self.conversationHistory.append(Message(
                     role: .assistant,
-                    content: response.content.isEmpty ? stepDescription(for: stepType) : response.content,
+                    content: response.content.isEmpty ? self.stepDescription(for: stepType) : response.content,
+                    thinking: response.thinking, // Display-only
                     toolCall: Message.ToolCall(
                         id: tc.id,
                         command: tc.command,
-                        workingDirectory: tc.workingDirectory,
+                        workingDirectory: tc
+                            .workingDirectory,
                         purpose: tc.purpose
                     ),
                     stepType: stepType
                 ))
-                
+
                 // Push step to notch
-                if enableNotchOutput {
-                    let statusText = tc.purpose ?? stepDescription(for: stepType)
+                if self.shouldSyncCommandNotchState {
+                    let statusText = tc.purpose ?? self.stepDescription(for: stepType)
                     NotchContentState.shared.addCommandMessage(role: .status, content: statusText)
                 }
-                
+
                 // Check if we need confirmation for destructive commands
-                if SettingsStore.shared.commandModeConfirmBeforeExecute && isDestructiveCommand(tc.command) {
-                    pendingCommand = PendingCommand(
+                if SettingsStore.shared.commandModeConfirmBeforeExecute, self.isDestructiveCommand(tc.command) {
+                    self.didRequireConfirmationThisRun = true
+                    self.pendingCommand = PendingCommand(
                         id: tc.id,
                         command: tc.command,
                         workingDirectory: tc.workingDirectory,
                         purpose: tc.purpose
                     )
-                    isProcessing = false
-                    currentStep = nil
-                    
+                    self.isProcessing = false
+                    self.currentStep = nil
+
                     // Push confirmation needed to notch
-                    if enableNotchOutput {
+                    if self.shouldSyncCommandNotchState {
                         NotchContentState.shared.addCommandMessage(role: .status, content: "⚠️ Confirmation needed in Command Mode window")
                         NotchContentState.shared.setCommandProcessing(false)
                     }
                     return
                 }
-                
+
                 // Auto-execute
-                await executeCommand(tc.command, workingDirectory: tc.workingDirectory, callId: tc.id, purpose: tc.purpose)
-                
+                await self.executeCommand(tc.command, workingDirectory: tc.workingDirectory, callId: tc.id, purpose: tc.purpose)
+
             } else {
                 // Just a text response - check if it's a final summary
                 let isFinal = response.content.lowercased().contains("complete") ||
-                              response.content.lowercased().contains("done") ||
-                              response.content.lowercased().contains("success") ||
-                              response.content.lowercased().contains("finished")
-                
-                conversationHistory.append(Message(
+                    response.content.lowercased().contains("done") ||
+                    response.content.lowercased().contains("success") ||
+                    response.content.lowercased().contains("finished")
+
+                self.conversationHistory.append(Message(
                     role: .assistant,
                     content: response.content,
+                    thinking: response.thinking, // Display-only
                     stepType: isFinal ? .success : .normal
                 ))
-                isProcessing = false
-                currentStep = .completed(isFinal)
-                
+                self.isProcessing = false
+                self.currentStep = .completed(isFinal)
+
                 // Auto-save on completion
-                saveCurrentChat()
-                
+                self.saveCurrentChat()
+
+                self.captureCommandRunCompleted(success: isFinal)
+
                 // Push final response to notch and show expanded view
-                if enableNotchOutput {
-                    NotchContentState.shared.updateCommandStreamingText("")  // Clear streaming
+                if self.shouldSyncCommandNotchState {
+                    NotchContentState.shared.updateCommandStreamingText("") // Clear streaming
                     NotchContentState.shared.addCommandMessage(role: .assistant, content: response.content)
                     NotchContentState.shared.setCommandProcessing(false)
-                    showExpandedNotchIfNeeded()
+                    self.showExpandedNotchIfNeeded()
                 }
             }
-            
+
         } catch {
-            let errorMsg = "Error: \(error.localizedDescription)"
-            conversationHistory.append(Message(
+            let errorMsg: String
+            if case LLMError.invalidRequest = error {
+                errorMsg = error.localizedDescription
+            } else {
+                errorMsg = "Error: \(error.localizedDescription)"
+            }
+            DebugLogger.shared.error("Command mode failed: \(error.localizedDescription)", source: "CommandModeService")
+            if notifyInvalidRequest, case LLMError.invalidRequest = error {
+                NotificationService.showCommandModeFailure(error: errorMsg)
+            }
+            self.conversationHistory.append(Message(
                 role: .assistant,
                 content: errorMsg,
                 stepType: .failure
             ))
-            isProcessing = false
-            currentStep = .completed(false)
-            
+            self.isProcessing = false
+            self.currentStep = .completed(false)
+
             // Auto-save on error
-            saveCurrentChat()
-            
+            self.saveCurrentChat()
+
+            self.captureCommandRunCompleted(success: false)
+
             // Push error to notch
-            if enableNotchOutput {
+            if self.shouldSyncCommandNotchState {
                 NotchContentState.shared.addCommandMessage(role: .assistant, content: errorMsg)
                 NotchContentState.shared.setCommandProcessing(false)
-                showExpandedNotchIfNeeded()
+                self.showExpandedNotchIfNeeded()
             }
         }
     }
-    
+
+    private func captureCommandRunCompleted(success: Bool) {
+        let toolCalls = self.conversationHistory.compactMap { $0.toolCall }.count
+        let turns = self.currentTurnCount
+
+        let turnsBucket: String
+        switch turns {
+        case ...1: turnsBucket = "1"
+        case 2...3: turnsBucket = "2-3"
+        case 4...7: turnsBucket = "4-7"
+        case 8...20: turnsBucket = "8-20"
+        default: turnsBucket = "20+"
+        }
+
+        let toolCallsBucket: String
+        switch toolCalls {
+        case 0: toolCallsBucket = "0"
+        case 1...2: toolCallsBucket = "1-2"
+        case 3...5: toolCallsBucket = "3-5"
+        default: toolCallsBucket = "6+"
+        }
+
+        AnalyticsService.shared.capture(
+            .commandModeRunCompleted,
+            properties: [
+                "success": success,
+                "turns_bucket": turnsBucket,
+                "tool_calls_bucket": toolCallsBucket,
+                "confirmation_needed": self.didRequireConfirmationThisRun,
+            ]
+        )
+    }
+
     /// Show expanded notch output if there's content to display
     private func showExpandedNotchIfNeeded() {
-        guard enableNotchOutput else { return }
+        guard self.shouldSyncCommandNotchState else { return }
+        guard NotchOverlayManager.shared.canShowExpandedCommandOutput else { return }
         guard !NotchContentState.shared.commandConversationHistory.isEmpty else { return }
-        
+
         // Show the expanded notch
         NotchOverlayManager.shared.showExpandedCommandOutput()
     }
-    
+
     private func determineStepType(for command: String, purpose: String?) -> Message.StepType {
         let cmd = command.lowercased()
         let purposeLower = purpose?.lowercased() ?? ""
-        
+
         // Check commands
         if purposeLower.contains("check") || purposeLower.contains("verify") || purposeLower.contains("exist") {
             return .checking
         }
         if cmd.hasPrefix("ls ") || cmd.hasPrefix("cat ") || cmd.hasPrefix("test ") || cmd.hasPrefix("[ ") ||
-           cmd.contains("--version") || cmd.contains("which ") || cmd.contains("file ") ||
-           cmd.hasPrefix("stat ") || cmd.hasPrefix("head ") || cmd.hasPrefix("tail ") {
+            cmd.contains("--version") || cmd.contains("which ") || cmd.contains("file ") ||
+            cmd.hasPrefix("stat ") || cmd.hasPrefix("head ") || cmd.hasPrefix("tail ")
+        {
             return .checking
         }
-        
+
         // Verification commands
         if purposeLower.contains("confirm") || purposeLower.contains("result") {
             return .verifying
         }
-        
+
         return .executing
     }
-    
+
     private func stepDescription(for stepType: Message.StepType) -> String {
         switch stepType {
         case .checking: return "Checking prerequisites..."
@@ -517,29 +590,29 @@ final class CommandModeService: ObservableObject {
         default: return ""
         }
     }
-    
+
     private func isDestructiveCommand(_ command: String) -> Bool {
         let cmd = command.lowercased()
-        
+
         // Commands that start with these are destructive
         let destructivePrefixes = [
             "rm ", "rm\t", "rmdir ", "rm -", // delete
-            "mv ", "mv\t",                    // move/rename
-            "sudo ",                          // elevated privileges
-            "kill ", "pkill ", "killall ",    // terminate processes
-            "chmod ", "chown ", "chgrp ",     // change permissions/ownership
-            "dd ",                            // disk operations
-            "mkfs", "format",                 // filesystem formatting
-            "> ",                             // overwrite file
-            "truncate ",                      // truncate file
-            "shred ",                         // secure delete
+            "mv ", "mv\t", // move/rename
+            "sudo ", // elevated privileges
+            "kill ", "pkill ", "killall ", // terminate processes
+            "chmod ", "chown ", "chgrp ", // change permissions/ownership
+            "dd ", // disk operations
+            "mkfs", "format", // filesystem formatting
+            "> ", // overwrite file
+            "truncate ", // truncate file
+            "shred ", // secure delete
         ]
-        
+
         // Check if command starts with any destructive prefix
         if destructivePrefixes.contains(where: { cmd.hasPrefix($0) }) {
             return true
         }
-        
+
         // Check for destructive patterns anywhere in piped commands
         let destructivePatterns = [
             "| rm ", "| sudo ", "| dd ",
@@ -547,51 +620,51 @@ final class CommandModeService: ObservableObject {
             "&& rm ", "&& sudo ",
             "xargs rm", "xargs -I",
         ]
-        
+
         if destructivePatterns.contains(where: { cmd.contains($0) }) {
             return true
         }
-        
+
         // rm with flags like -rf, -r, -f anywhere
         if cmd.contains("rm -") {
             return true
         }
-        
+
         return false
     }
-    
+
     private func executeCommand(_ command: String, workingDirectory: String?, callId: String, purpose: String? = nil) async {
-        currentStep = .executing(command)
-        
+        self.currentStep = .executing(command)
+
         let result = await terminalService.execute(
             command: command,
             workingDirectory: workingDirectory
         )
-        
+
         // Create enhanced result with context
         let enhancedResult = EnhancedCommandResult(
             result: result,
             purpose: purpose
         )
-        
+
         let resultJSON = enhancedResult.toJSON()
-        
+
         // Determine result step type
         let resultStepType: Message.StepType = result.success ? .success : .failure
-        
+
         // Add tool result to conversation
-        conversationHistory.append(Message(
+        self.conversationHistory.append(Message(
             role: .tool,
             content: resultJSON,
             stepType: resultStepType
         ))
-        
+
         // Continue the loop - let the AI see the result and decide what to do next
-        await processNextTurn()
+        await self.processNextTurn()
     }
-    
+
     // MARK: - Enhanced Result
-    
+
     private struct EnhancedCommandResult: Codable {
         let success: Bool
         let command: String
@@ -600,7 +673,7 @@ final class CommandModeService: ObservableObject {
         let exitCode: Int32
         let executionTimeMs: Int
         let purpose: String?
-        
+
         init(result: TerminalService.CommandResult, purpose: String?) {
             self.success = result.success
             self.command = result.command
@@ -610,26 +683,28 @@ final class CommandModeService: ObservableObject {
             self.executionTimeMs = result.executionTimeMs
             self.purpose = purpose
         }
-        
+
         func toJSON() -> String {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             if let data = try? encoder.encode(self),
-               let json = String(data: data, encoding: .utf8) {
+               let json = String(data: data, encoding: .utf8)
+            {
                 return json
             }
             return """
-            {"success": \(success), "output": "\(output)", "exitCode": \(exitCode)}
+            {"success": \(self.success), "output": "\(self.output)", "exitCode": \(self.exitCode)}
             """
         }
     }
-    
+
     // MARK: - LLM Integration
-    
+
     private struct LLMResponse {
         let content: String
+        let thinking: String? // Display-only, NOT sent back to API
         let toolCall: ToolCallData?
-        
+
         struct ToolCallData {
             let id: String
             let command: String
@@ -637,119 +712,133 @@ final class CommandModeService: ObservableObject {
             let purpose: String?
         }
     }
-    
+
     private func callLLM() async throws -> LLMResponse {
         let settings = SettingsStore.shared
-        // Use Command Mode's independent provider/model settings
-        let providerID = settings.commandModeSelectedProviderID
-        let model = settings.commandModeSelectedModel ?? "gpt-4o"
-        let apiKey = settings.providerAPIKeys[providerID] ?? ""
-        
+        if let issue = settings.commandModeReadinessIssue {
+            throw LLMError.invalidRequest(issue)
+        }
+
+        let providerID = settings.effectiveCommandModeProviderID
+        let model = settings.effectiveCommandModeSelectedModel
+        let apiKey = settings.getAPIKey(for: providerID) ?? ""
+
         let baseURL: String
         if let provider = settings.savedProviders.first(where: { $0.id == providerID }) {
             baseURL = provider.baseURL
-        } else if providerID == "groq" {
-            baseURL = "https://api.groq.com/openai/v1"
+        } else if ModelRepository.shared.isBuiltIn(providerID) {
+            baseURL = ModelRepository.shared.defaultBaseURL(for: providerID)
         } else {
-            baseURL = "https://api.openai.com/v1"
+            baseURL = ""
         }
-        
+
         // Build conversation with agentic system prompt
         let systemPrompt = """
         You are an autonomous, thoughtful macOS terminal agent. Execute user requests reliably and safely.
-        
+
         ## AGENTIC WORKFLOW (Follow this pattern):
-        
+
         ### 1. PRE-FLIGHT CHECKS (Always do this first!)
         Before ANY action, verify prerequisites:
         - File operations: Check if file/folder exists first (`ls`, `test -e`, `[ -f file ]`)
         - Deletions: List contents before removing, confirm target exists
         - Modifications: Read current state before changing
         - Installations: Check if already installed (`which`, `--version`)
-        
+
         ### 2. EXECUTE WITH CONTEXT
         When calling execute_terminal_command, ALWAYS include a `purpose` parameter explaining:
         - "checking" - Verifying something exists/state
-        - "executing" - Performing the main action  
+        - "executing" - Performing the main action
         - "verifying" - Confirming the result
         Example purposes: "Checking if image1.png exists", "Creating the backup directory", "Verifying file was deleted"
-        
+
         ### 3. POST-ACTION VERIFICATION
         After modifying anything, verify it worked:
         - Created file? `ls` to confirm it exists
-        - Deleted file? `ls` to confirm it's gone  
+        - Deleted file? `ls` to confirm it's gone
         - Modified content? `cat` or `head` to verify changes
         - Installed app? Check version/existence
-        
+
         ### 4. HANDLE FAILURES GRACEFULLY
         - If something doesn't exist: Tell the user clearly
         - If command fails: Analyze error, try alternative approach
         - If permission denied: Explain and suggest solutions
         - Never assume success without verification
-        
+
         ## RESPONSE FORMAT:
         - Keep reasoning brief and clear
         - State what you're checking/doing before each command
         - After verification, give a clear success/failure summary
         - Use natural language, not code comments
-        
+
         ## SAFETY RULES:
         - For destructive ops (rm, mv, overwrite): ALWAYS check target exists first
         - Show what will be affected before destroying
         - Prefer `rm -i` or listing contents before bulk deletes
         - Use full absolute paths when possible
-        
+
         ## EXAMPLES OF GOOD BEHAVIOR:
-        
+
         User: "Delete image1.png in Downloads"
         You: First check if it exists
         → execute_terminal_command(command: "ls -la ~/Downloads/image1.png", purpose: "Checking if image1.png exists")
         If exists → execute_terminal_command(command: "rm ~/Downloads/image1.png", purpose: "Deleting the file")
         Then verify → execute_terminal_command(command: "ls ~/Downloads/image1.png 2>&1", purpose: "Verifying file was deleted")
         Finally: "✓ Successfully deleted image1.png from Downloads."
-        
+
         User: "Create a project folder with a readme"
         You: → Check if folder exists, create it, create readme, verify both
-        
+
         ## NATIVE macOS APP CONTROL (Use osascript):
         For Reminders, Notes, Calendar, Messages, Mail, and other native macOS apps, use `osascript`:
-        
+
         ### Reminders:
         - Create reminder (default list): `osascript -e 'tell application "Reminders" to make new reminder with properties {name:"<text>"}'`
         - Create in specific list: `osascript -e 'tell application "Reminders" to make new reminder at end of list "<ListName>" with properties {name:"<text>"}'`
         - With due date: `osascript -e 'tell application "Reminders" to make new reminder with properties {name:"<text>", due date:date "12/25/2024 3:00 PM"}'`
         - ⚠️ Do NOT use `reminders list 1` syntax - it causes errors. Use `list "<name>"` or omit the list entirely.
-        
+
         ### Notes:
         - Create note: `osascript -e 'tell application "Notes" to make new note at folder "Notes" with properties {name:"<title>", body:"<content>"}'`
-        
+
         ### Calendar:
         - Create event: `osascript -e 'tell application "Calendar" to tell calendar "<CalendarName>" to make new event with properties {summary:"<title>", start date:date "<date>", end date:date "<date>"}'`
-        
+
         ### Messages:
         - Send iMessage: `osascript -e 'tell application "Messages" to send "<message>" to buddy "<phone/email>"'`
-        
+
         ### General Pattern:
         Always use `osascript -e 'tell application "<AppName>" to ...'` for native app automation.
-        
-        The user is on macOS with zsh shell. Be thorough but efficient. 
+
+        The user is on macOS with zsh shell. Be thorough but efficient.
         When task is complete, provide a clear summary starting with ✓ or ✗.
         """
-        
+
         var messages: [[String: Any]] = [
-            ["role": "system", "content": systemPrompt]
+            ["role": "system", "content": systemPrompt],
         ]
-        
+
         // Add conversation history
         var lastToolCallId: String? = nil
-        
-        for msg in conversationHistory {
+
+        for msg in self.conversationHistory {
             switch msg.role {
             case .user:
                 messages.append(["role": "user", "content": msg.content])
             case .assistant:
                 if let tc = msg.toolCall {
                     lastToolCallId = tc.id
+                    let argsJSON: String
+                    do {
+                        let data = try JSONSerialization.data(withJSONObject: [
+                            "command": tc.command,
+                            "workingDirectory": tc.workingDirectory ?? "",
+                        ])
+                        argsJSON = String(data: data, encoding: .utf8) ?? "{}"
+                    } catch {
+                        DebugLogger.shared.error("Failed to encode tool call args: \(error)", source: "CommandModeService")
+                        argsJSON = "{}"
+                    }
                     messages.append([
                         "role": "assistant",
                         "content": msg.content,
@@ -758,12 +847,9 @@ final class CommandModeService: ObservableObject {
                             "type": "function",
                             "function": [
                                 "name": "execute_terminal_command",
-                                "arguments": try! String(data: JSONSerialization.data(withJSONObject: [
-                                    "command": tc.command,
-                                    "workingDirectory": tc.workingDirectory ?? ""
-                                ]), encoding: .utf8)!
-                            ]
-                        ]]
+                                "arguments": argsJSON,
+                            ],
+                        ]],
                     ])
                 } else {
                     messages.append(["role": "assistant", "content": msg.content])
@@ -772,259 +858,162 @@ final class CommandModeService: ObservableObject {
                 messages.append([
                     "role": "tool",
                     "content": msg.content,
-                    "tool_call_id": lastToolCallId ?? "call_unknown"
+                    "tool_call_id": lastToolCallId ?? "call_unknown",
                 ])
             }
         }
-        
-        // We assume conversationHistory contains the user's latest message already
 
-        
         // Check streaming setting
         let enableStreaming = SettingsStore.shared.enableAIStreaming
-        
-        // Build request
-        var body: [String: Any] = [
-            "model": model,
-            "messages": messages,
-            "tools": [TerminalService.toolDefinition],
-            "tool_choice": "auto",
-            "temperature": 0.1
-        ]
-        
+
+        // Reasoning models (o1, o3, gpt-5) don't support temperature parameter at all
+        let isReasoningModel = settings.isReasoningModel(model)
+        let isTemperatureUnsupported = settings.isTemperatureUnsupported(model)
+
+        // Get reasoning config for this model (e.g., reasoning_effort, enable_thinking)
+        let reasoningConfig = SettingsStore.shared.getReasoningConfig(forModel: model, provider: providerID)
+        var extraParams: [String: Any] = [:]
+        if let rConfig = reasoningConfig, rConfig.isEnabled {
+            if rConfig.parameterName == "enable_thinking" {
+                extraParams = [rConfig.parameterName: rConfig.parameterValue == "true"]
+            } else {
+                extraParams = [rConfig.parameterName: rConfig.parameterValue]
+            }
+            DebugLogger.shared.debug("Added reasoning param: \(rConfig.parameterName)=\(rConfig.parameterValue)", source: "CommandModeService")
+        }
+
+        // Reset streaming state
+        self.streamingText = ""
+        self.streamingThinkingText = ""
+        self.streamingBuffer = []
+        self.thinkingBuffer = []
+        self.lastUIUpdate = CFAbsoluteTimeGetCurrent()
+        self.lastThinkingUIUpdate = CFAbsoluteTimeGetCurrent()
+
+        // Build LLMClient configuration
+        var config = LLMClient.Config(
+            messages: messages,
+            model: model,
+            baseURL: baseURL,
+            apiKey: apiKey,
+            streaming: enableStreaming,
+            tools: [TerminalService.toolDefinition],
+            temperature: isTemperatureUnsupported ? nil : 0.1,
+            maxTokens: isReasoningModel ? 32_000 : nil, // Reasoning models like o1 need a large budget for extended thought chains
+            extraParameters: extraParams
+        )
+
+        // Keep retry logic (exponential backoff)
+        config.maxRetries = 3
+        config.retryDelayMs = 200
+
+        // Add real-time streaming callbacks for UI updates (60fps throttled)
         if enableStreaming {
-            body["stream"] = true
-        }
-        
-        let endpoint = baseURL.hasSuffix("/chat/completions") ? baseURL : "\(baseURL)/chat/completions"
-        guard let url = URL(string: endpoint) else {
-            throw NSError(domain: "CommandMode", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        // Retry logic for transient network errors (DNS resolution, connection cold start)
-        var lastError: Error?
-        for attempt in 1...3 {
-            do {
-                if enableStreaming {
-                    return try await processStreamingLLMResponse(request: request)
-                } else {
-                    return try await processNonStreamingLLMResponse(request: request)
-                }
-            } catch let error as URLError where error.code == .notConnectedToInternet || 
-                                                 error.code == .timedOut ||
-                                                 error.code == .networkConnectionLost ||
-                                                 error.code == .cannotFindHost ||
-                                                 error.code == .cannotConnectToHost {
-                lastError = error
-                if attempt < 3 {
-                    // Wait before retry (exponential backoff: 200ms, 400ms)
-                    try? await Task.sleep(nanoseconds: UInt64(200_000_000 * attempt))
-                    continue
-                }
-            } catch {
-                throw error  // Non-retryable error
-            }
-        }
-        throw lastError ?? NSError(domain: "CommandMode", code: -1, userInfo: [NSLocalizedDescriptionKey: "Network request failed after retries"])
-    }
-    
-    // MARK: - Non-Streaming Response
-    private func processNonStreamingLLMResponse(request: URLRequest) async throws -> LLMResponse {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            let err = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "CommandMode", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: err])
-        }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let choice = choices.first,
-              let message = choice["message"] as? [String: Any] else {
-            throw NSError(domain: "CommandMode", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
-        }
-        
-        return parseMessageResponse(message)
-    }
-    
-    // MARK: - Streaming Response with Real-time UI Updates
-    private func processStreamingLLMResponse(request: URLRequest) async throws -> LLMResponse {
-        streamingText = ""
-        streamingBuffer = []
-        lastUIUpdate = CFAbsoluteTimeGetCurrent()
-        
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            var errorData = Data()
-            for try await byte in bytes {
-                errorData.append(byte)
-            }
-            let errText = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "CommandMode", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: errText])
-        }
-        
-        var toolCallId: String?
-        var toolCallName: String?
-        var toolCallArguments = ""
-        
-        // Use efficient line-based iteration instead of byte-by-byte
-        for try await rawLine in bytes.lines {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            
-            guard line.hasPrefix("data:") else { continue }
-            
-            var jsonString = String(line.dropFirst(5))
-            if jsonString.hasPrefix(" ") {
-                jsonString = String(jsonString.dropFirst(1))
-            }
-            
-            if jsonString.trimmingCharacters(in: .whitespaces) == "[DONE]" {
-                continue
-            }
-            
-            guard let jsonData = jsonString.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let firstChoice = choices.first,
-                  let delta = firstChoice["delta"] as? [String: Any] else {
-                continue
-            }
-            
-            // Handle text content - use buffer to avoid O(n²) string concat
-            if let content = delta["content"] as? String {
-                streamingBuffer.append(content)
-                
-                // Adaptive throttle: slower updates as content grows (reduces SwiftUI layout overhead)
-                let bufferLength = streamingBuffer.count
-                let updateInterval: CFAbsoluteTime
-                if bufferLength < 50 {
-                    updateInterval = 0.016  // 60fps for first ~50 tokens
-                } else if bufferLength < 200 {
-                    updateInterval = 0.033  // 30fps for medium content
-                } else {
-                    updateInterval = 0.066  // 15fps for long content
-                }
-                
-                let now = CFAbsoluteTimeGetCurrent()
-                if now - lastUIUpdate >= updateInterval {
-                    lastUIUpdate = now
-                    let fullContent = streamingBuffer.joined()
-                    streamingText = fullContent
-                    
-                    // Push to notch for real-time display
-                    if enableNotchOutput {
-                        NotchContentState.shared.updateCommandStreamingText(fullContent)
+            // Thinking tokens callback
+            config.onThinkingChunk = { [weak self] (chunk: String) in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    self.thinkingBuffer.append(chunk)
+
+                    // 60fps UI update throttle for thinking
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - self.lastThinkingUIUpdate >= 0.016 {
+                        self.lastThinkingUIUpdate = now
+                        self.streamingThinkingText = self.thinkingBuffer.joined()
                     }
                 }
             }
-            
-            // Handle tool calls (streamed in parts)
-            if let toolCalls = delta["tool_calls"] as? [[String: Any]],
-               let toolCall = toolCalls.first {
-                
-                if let id = toolCall["id"] as? String {
-                    toolCallId = id
-                }
-                
-                if let function = toolCall["function"] as? [String: Any] {
-                    if let name = function["name"] as? String {
-                        toolCallName = name
-                    }
-                    if let args = function["arguments"] as? String {
-                        toolCallArguments += args
+
+            // Content callback
+            config.onContentChunk = { [weak self] (chunk: String) in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    self.streamingBuffer.append(chunk)
+
+                    // 60fps UI update throttle
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - self.lastUIUpdate >= 0.016 {
+                        self.lastUIUpdate = now
+                        let fullContent = self.streamingBuffer.joined()
+                        self.streamingText = fullContent
+
+                        // Push to notch for real-time display
+                        if self.shouldSyncCommandNotchState {
+                            NotchContentState.shared.updateCommandStreamingText(fullContent)
+                        }
                     }
                 }
             }
         }
-        
-        // Final update - join buffer once at the end
-        let fullContent = streamingBuffer.joined()
+
+        DebugLogger.shared.info("Using LLMClient for Command Mode (streaming=\(enableStreaming), messages=\(messages.count), history=\(self.conversationHistory.count))", source: "CommandModeService")
+
+        let response = try await LLMClient.shared.call(config)
+
+        // Final UI update - ensure all content is displayed
+        let fullContent = self.streamingBuffer.joined()
         if !fullContent.isEmpty {
-            streamingText = fullContent
-            if enableNotchOutput {
+            self.streamingText = fullContent
+            if self.shouldSyncCommandNotchState {
                 NotchContentState.shared.updateCommandStreamingText(fullContent)
             }
         }
-        
+
         // Small delay to let the final content render, then clear
-        try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-        
-        streamingText = ""  // Clear streaming text when done
-        streamingBuffer = []  // Clear buffer
-        
+        try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+
+        // Capture final thinking before clearing (for message storage)
+        let finalThinking = response.thinking ?? (self.thinkingBuffer.isEmpty ? nil : self.thinkingBuffer.joined())
+
+        self.streamingText = "" // Clear streaming text when done
+        self.streamingThinkingText = "" // Clear thinking text when done
+        self.streamingBuffer = [] // Clear buffer
+        self.thinkingBuffer = [] // Clear thinking buffer
+
         // Clear notch streaming text as well
-        if enableNotchOutput {
+        if self.shouldSyncCommandNotchState {
             NotchContentState.shared.updateCommandStreamingText("")
         }
-        
-        // If we got a tool call, parse it
-        if let name = toolCallName, name == "execute_terminal_command",
-           let argsData = toolCallArguments.data(using: .utf8),
-           let args = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
-            
-            let command = args["command"] as? String ?? ""
-            let workDir = args["workingDirectory"] as? String
-            let purpose = args["purpose"] as? String
-            let callId = toolCallId ?? "call_\(UUID().uuidString.prefix(8))"
-            
-            return LLMResponse(
-                content: fullContent,
-                toolCall: LLMResponse.ToolCallData(
-                    id: callId,
-                    command: command,
-                    workingDirectory: workDir?.isEmpty == true ? nil : workDir,
-                    purpose: purpose
-                )
-            )
+
+        // Log thinking if present (for debugging)
+        if let thinking = finalThinking {
+            DebugLogger.shared.debug("LLM thinking tokens extracted (\(thinking.count) chars)", source: "CommandModeService")
         }
-        
-        // Text response only
-        return LLMResponse(
-            content: fullContent.isEmpty ? "I couldn't understand that." : fullContent,
-            toolCall: nil
-        )
-    }
-    
-    // MARK: - Parse Message Helper
-    private func parseMessageResponse(_ message: [String: Any]) -> LLMResponse {
+
+        // Convert LLMClient.Response to our internal LLMResponse
         // Check for tool calls
-        if let toolCalls = message["tool_calls"] as? [[String: Any]],
-           let toolCall = toolCalls.first,
-           let function = toolCall["function"] as? [String: Any],
-           let name = function["name"] as? String,
-           name == "execute_terminal_command",
-           let argsString = function["arguments"] as? String,
-           let argsData = argsString.data(using: .utf8),
-           let args = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
-            
-            let command = args["command"] as? String ?? ""
-            let workDir = args["workingDirectory"] as? String
-            let purpose = args["purpose"] as? String
-            let callId = toolCall["id"] as? String ?? "call_\(UUID().uuidString.prefix(8))"
-            
+        if let tc = response.toolCalls.first,
+           tc.name == "execute_terminal_command"
+        {
+            let command = tc.getString("command") ?? ""
+            let workDir = tc.getOptionalString("workingDirectory")
+            let purpose = tc.getString("purpose")
+
             return LLMResponse(
-                content: message["content"] as? String ?? "",
+                content: response.content,
+                thinking: finalThinking, // Display-only
                 toolCall: LLMResponse.ToolCallData(
-                    id: callId,
+                    id: tc.id,
                     command: command,
-                    workingDirectory: workDir?.isEmpty == true ? nil : workDir,
+                    workingDirectory: workDir,
                     purpose: purpose
                 )
             )
         }
-        
+
+        if response.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            DebugLogger.shared.error(
+                "Command mode LLM returned empty content with no tool calls (model=\(model), provider=\(providerID))",
+                source: "CommandModeService"
+            )
+            throw LLMError.invalidResponse
+        }
+
         // Text response only
         return LLMResponse(
-            content: message["content"] as? String ?? "I couldn't understand that.",
+            content: response.content,
+            thinking: finalThinking, // Display-only
             toolCall: nil
         )
     }
 }
-

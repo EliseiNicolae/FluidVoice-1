@@ -5,21 +5,28 @@
 //  Created by Barathwaj Anandan on 7/30/25.
 //
 
-import SwiftUI
 import AppKit
 import ApplicationServices
+import SwiftUI
 
 @main
-struct fluidApp: App {
+struct FluidApp: App {
     @StateObject private var menuBarManager = MenuBarManager()
+    @StateObject private var appServices: AppServices
+    @ObservedObject private var settings = SettingsStore.shared
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @State private var theme = AppTheme.dark
+
+    init() {
+        // Use the shared singleton instance
+        _appServices = StateObject(wrappedValue: AppServices.shared)
+    }
 
     var body: some Scene {
         WindowGroup(id: "main") {
             ContentView()
-                .environmentObject(menuBarManager)
-                .appTheme(theme)
+                .environmentObject(self.menuBarManager)
+                .environmentObject(self.appServices)
+                .appTheme(AppTheme.dark(accent: self.settings.accentColor))
                 .preferredColorScheme(.dark)
         }
         .defaultSize(width: 1000, height: 700)

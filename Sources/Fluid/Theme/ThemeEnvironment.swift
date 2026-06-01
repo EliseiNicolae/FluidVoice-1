@@ -18,12 +18,27 @@ extension View {
     }
 }
 
+// MARK: - Color Hex Initializer
 
+extension Color {
+    /// Initialize a Color from a hex string (e.g., "#FF5733" or "FF5733")
+    init?(hex: String) {
+        var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
 
+        guard hexSanitized.count == 6 else { return nil }
 
+        var rgb: UInt64 = 0
+        guard Scanner(string: hexSanitized).scanHexInt64(&rgb) else { return nil }
 
+        let red = Double((rgb & 0xff0000) >> 16) / 255.0
+        let green = Double((rgb & 0x00ff00) >> 8) / 255.0
+        let blue = Double(rgb & 0x0000ff) / 255.0
 
+        self.init(red: red, green: green, blue: blue)
+    }
 
-
-
-
+    static var fluidGreen: Color {
+        SettingsStore.shared.accentColor
+    }
+}

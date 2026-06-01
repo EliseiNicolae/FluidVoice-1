@@ -1,64 +1,137 @@
 import SwiftUI
 
+enum FluidInteractionVisuals {
+    static let hoverScale: CGFloat = 1.01
+    static let pressedScale: CGFloat = 0.97
+    static let hoverAnimation: Animation = .spring(response: 0.18, dampingFraction: 0.78)
+    static let pressedAnimation: Animation = .spring(response: 0.2, dampingFraction: 0.8)
+
+    static func scale(isPressed: Bool, isHovered: Bool) -> CGFloat {
+        if isPressed { return self.pressedScale }
+        return isHovered ? self.hoverScale : 1
+    }
+}
+
+extension View {
+    func fluidControlSurface(
+        isSelected: Bool,
+        isHovered: Bool,
+        tone: Color,
+        cornerRadius: CGFloat
+    ) -> some View {
+        self.modifier(FluidControlSurfaceModifier(
+            isSelected: isSelected,
+            isHovered: isHovered,
+            tone: tone,
+            cornerRadius: cornerRadius
+        ))
+    }
+}
+
+private struct FluidControlSurfaceModifier: ViewModifier {
+    @Environment(\.theme) private var theme
+    let isSelected: Bool
+    let isHovered: Bool
+    let tone: Color
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: self.cornerRadius, style: .continuous)
+        let fillOpacity = self.isSelected ? 0.96 : (self.isHovered ? 0.42 : 0)
+        let shineOpacity = self.isSelected ? 0.14 : (self.isHovered ? 0.07 : 0)
+        let strokeColor = self.isSelected
+            ? self.tone.opacity(0.24)
+            : (self.isHovered ? self.theme.palette.cardBorder.opacity(0.28) : .clear)
+
+        content
+            .background(
+                shape
+                    .fill(self.theme.palette.cardBackground.opacity(fillOpacity))
+                    .overlay(
+                        LinearGradient(
+                            colors: [.white.opacity(shineOpacity), .clear],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                        .clipShape(shape)
+                    )
+                    .overlay(shape.stroke(strokeColor, lineWidth: 1))
+                    .shadow(
+                        color: .black.opacity(self.isSelected ? 0.16 : (self.isHovered ? 0.08 : 0)),
+                        radius: self.isSelected || self.isHovered ? 5 : 0,
+                        y: self.isSelected || self.isHovered ? 1 : 0
+                    )
+            )
+            .scaleEffect(self.isHovered && !self.isSelected ? FluidInteractionVisuals.hoverScale : 1)
+            .animation(FluidInteractionVisuals.hoverAnimation, value: self.isSelected)
+            .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+    }
+}
+
 // MARK: - Primary (Prominent) Button
+
 struct GlassButtonStyle: ButtonStyle {
+    var height: CGFloat? = nil
+
     func makeBody(configuration: Configuration) -> some View {
-        GlassButton(configuration: configuration)
+        GlassButton(configuration: configuration, height: self.height)
     }
 
     private struct GlassButton: View {
         @Environment(\.theme) private var theme
         @State private var isHovered = false
         let configuration: ButtonStyle.Configuration
+        let height: CGFloat?
 
         private var shape: RoundedRectangle {
-            RoundedRectangle(cornerRadius: theme.metrics.corners.md, style: .continuous)
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
         }
 
         var body: some View {
-            configuration.label
+            self.configuration.label
                 .fontWeight(.semibold)
-                .padding(.horizontal, theme.metrics.spacing.lg)
-                .padding(.vertical, theme.metrics.spacing.md)
-                .frame(minHeight: 36)
-                .foregroundStyle(theme.palette.primaryText)
-                .background(theme.materials.card, in: shape)
+                .padding(.horizontal, self.theme.metrics.spacing.lg)
+                .padding(.vertical, self.theme.metrics.spacing.sm)
+                .frame(height: self.height ?? 36)
+                .foregroundStyle(self.theme.palette.primaryText)
+                .background(self.theme.materials.card, in: self.shape)
                 .background(
-                    shape
-                        .fill(theme.palette.cardBackground)
+                    self.shape
+                        .fill(self.theme.palette.cardBackground)
                         .overlay(
-                            shape.stroke(
-                                theme.palette.cardBorder.opacity(isHovered ? 0.45 : 0.25),
+                            self.shape.stroke(
+                                self.theme.palette.cardBorder.opacity(self.isHovered ? 0.45 : 0.25),
                                 lineWidth: 1
                             )
                         )
                 )
                 .overlay(
-                    shape
-                        .stroke(theme.palette.accent.opacity(isHovered ? 0.25 : 0.1), lineWidth: 1)
+                    self.shape
+                        .stroke(self.theme.palette.accent.opacity(self.isHovered ? 0.25 : 0.1), lineWidth: 1)
                         .blendMode(.plusLighter)
                 )
                 .shadow(
-                    color: theme.palette.cardBorder.opacity(isHovered ? 0.45 : 0.22),
-                    radius: isHovered ? theme.metrics.cardShadow.radius : max(theme.metrics.cardShadow.radius - 3, 2),
+                    color: self.theme.palette.cardBorder.opacity(self.isHovered ? 0.45 : 0.22),
+                    radius: self.isHovered ? self.theme.metrics.cardShadow.radius : max(self.theme.metrics.cardShadow.radius - 3, 2),
                     x: 0,
-                    y: isHovered ? theme.metrics.cardShadow.y : theme.metrics.cardShadow.y - 2
+                    y: self.isHovered ? self.theme.metrics.cardShadow.y : self.theme.metrics.cardShadow.y - 2
                 )
-                .scaleEffect(configuration.isPressed ? 0.97 : (isHovered ? 1.01 : 1.0))
-                .animation(.spring(response: 0.18, dampingFraction: 0.78), value: isHovered)
-                .animation(.spring(response: 0.2, dampingFraction: 0.8), value: configuration.isPressed)
-                .onHover { isHovered = $0 }
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
         }
     }
 }
 
 // MARK: - Primary Accent Button
+
 struct PremiumButtonStyle: ButtonStyle {
     var isRecording: Bool = false
     var height: CGFloat = 44
 
     func makeBody(configuration: Configuration) -> some View {
-        PrimaryButton(configuration: configuration, isRecording: isRecording, height: height)
+        PrimaryButton(configuration: configuration, isRecording: self.isRecording, height: self.height)
     }
 
     private struct PrimaryButton: View {
@@ -69,15 +142,15 @@ struct PremiumButtonStyle: ButtonStyle {
         let height: CGFloat
 
         private var shape: RoundedRectangle {
-            RoundedRectangle(cornerRadius: theme.metrics.corners.lg, style: .continuous)
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.lg, style: .continuous)
         }
 
         private var baseGradient: LinearGradient {
-            if isRecording {
+            if self.isRecording {
                 return LinearGradient(
                     colors: [
                         Color(nsColor: .systemRed),
-                        Color(nsColor: .systemRed).opacity(0.8)
+                        Color(nsColor: .systemRed).opacity(0.8),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -86,8 +159,8 @@ struct PremiumButtonStyle: ButtonStyle {
 
             return LinearGradient(
                 colors: [
-                    theme.palette.accent.opacity(0.95),
-                    theme.palette.accent.opacity(0.75)
+                    self.theme.palette.accent.opacity(0.95),
+                    self.theme.palette.accent.opacity(0.75),
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -95,37 +168,38 @@ struct PremiumButtonStyle: ButtonStyle {
         }
 
         var body: some View {
-            configuration.label
+            self.configuration.label
                 .fontWeight(.semibold)
                 .frame(maxWidth: .infinity)
-                .frame(height: height)
-                .foregroundStyle(isRecording ? Color.white : theme.palette.primaryText)
+                .frame(height: self.height)
+                .foregroundStyle(self.isRecording ? Color.white : self.theme.palette.primaryText)
                 .background(
-                    shape
-                        .fill(baseGradient)
+                    self.shape
+                        .fill(self.baseGradient)
                         .overlay(
-                            shape.stroke(
-                                Color.white.opacity(isHovered ? 0.35 : 0.2),
+                            self.shape.stroke(
+                                Color.white.opacity(self.isHovered ? 0.35 : 0.2),
                                 lineWidth: 1
                             )
                         )
                 )
                 .shadow(
-                    color: (isRecording ? Color(nsColor: .systemRed) : theme.palette.accent)
-                        .opacity(isHovered ? 0.45 : 0.25),
-                    radius: isHovered ? theme.metrics.elevatedCardShadow.radius : max(theme.metrics.cardShadow.radius - 2, 2),
+                    color: (self.isRecording ? Color(nsColor: .systemRed) : self.theme.palette.accent)
+                        .opacity(self.isHovered ? 0.45 : 0.25),
+                    radius: self.isHovered ? self.theme.metrics.elevatedCardShadow.radius : max(self.theme.metrics.cardShadow.radius - 2, 2),
                     x: 0,
-                    y: isHovered ? theme.metrics.elevatedCardShadow.y : theme.metrics.cardShadow.y
+                    y: self.isHovered ? self.theme.metrics.elevatedCardShadow.y : self.theme.metrics.cardShadow.y
                 )
-                .scaleEffect(configuration.isPressed ? 0.98 : (isHovered ? 1.01 : 1.0))
-                .animation(.spring(response: 0.18, dampingFraction: 0.75), value: isHovered)
-                .animation(.spring(response: 0.18, dampingFraction: 0.75), value: configuration.isPressed)
-                .onHover { isHovered = $0 }
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
         }
     }
 }
 
 // MARK: - Secondary Button
+
 struct SecondaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         SecondaryButton(configuration: configuration)
@@ -137,46 +211,54 @@ struct SecondaryButtonStyle: ButtonStyle {
         let configuration: ButtonStyle.Configuration
 
         private var shape: RoundedRectangle {
-            RoundedRectangle(cornerRadius: theme.metrics.corners.lg, style: .continuous)
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.lg, style: .continuous)
         }
 
         var body: some View {
-            configuration.label
+            self.configuration.label
                 .fontWeight(.semibold)
                 .frame(maxWidth: .infinity)
                 .frame(height: 42)
-                .foregroundStyle(theme.palette.primaryText)
-                .background(theme.materials.card, in: shape)
+                .foregroundStyle(self.theme.palette.primaryText)
+                .background(self.theme.materials.card, in: self.shape)
                 .background(
-                    shape
-                        .fill(theme.palette.cardBackground)
+                    self.shape
+                        .fill(self.theme.palette.cardBackground)
                         .overlay(
-                            shape.stroke(
-                                theme.palette.cardBorder.opacity(isHovered ? 0.45 : 0.25),
+                            self.shape.stroke(
+                                self.theme.palette.cardBorder.opacity(self.isHovered ? 0.45 : 0.25),
                                 lineWidth: 1
                             )
                         )
                 )
                 .shadow(
-                    color: theme.palette.cardBorder.opacity(isHovered ? 0.35 : 0.15),
-                    radius: isHovered ? theme.metrics.cardShadow.radius : max(theme.metrics.cardShadow.radius - 4, 1),
+                    color: self.theme.palette.cardBorder.opacity(self.isHovered ? 0.35 : 0.15),
+                    radius: self.isHovered ? self.theme.metrics.cardShadow.radius : max(self.theme.metrics.cardShadow.radius - 4, 1),
                     x: 0,
-                    y: isHovered ? theme.metrics.cardShadow.y : theme.metrics.cardShadow.y - 2
+                    y: self.isHovered ? self.theme.metrics.cardShadow.y : self.theme.metrics.cardShadow.y - 2
                 )
-                .scaleEffect(configuration.isPressed ? 0.98 : (isHovered ? 1.01 : 1.0))
-                .animation(.spring(response: 0.18, dampingFraction: 0.78), value: isHovered)
-                .animation(.spring(response: 0.2, dampingFraction: 0.8), value: configuration.isPressed)
-                .onHover { isHovered = $0 }
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
         }
     }
 }
 
 // MARK: - Compact Button
+
 struct CompactButtonStyle: ButtonStyle {
     var isReady: Bool = false
+    var foreground: Color? = nil
+    var borderColor: Color? = nil
 
     func makeBody(configuration: Configuration) -> some View {
-        CompactButton(configuration: configuration, isReady: isReady)
+        CompactButton(
+            configuration: configuration,
+            isReady: self.isReady,
+            foreground: self.foreground,
+            borderColor: self.borderColor
+        )
     }
 
     private struct CompactButton: View {
@@ -184,45 +266,106 @@ struct CompactButtonStyle: ButtonStyle {
         @State private var isHovered = false
         let configuration: ButtonStyle.Configuration
         let isReady: Bool
+        let foreground: Color?
+        let borderColor: Color?
 
         private var shape: RoundedRectangle {
-            RoundedRectangle(cornerRadius: theme.metrics.corners.sm, style: .continuous)
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm, style: .continuous)
         }
 
         var body: some View {
-            configuration.label
+            let border = self.borderColor ?? (self.isReady ? self.theme.palette.accent : self.theme.palette.cardBorder)
+            let foregroundColor = self.foreground ?? self.theme.palette.primaryText
+
+            self.configuration.label
                 .fontWeight(.medium)
-                .frame(maxWidth: .infinity)
+                .padding(.horizontal, self.theme.metrics.spacing.md)
                 .frame(height: 34)
-                .foregroundStyle(theme.palette.primaryText)
-                .background(theme.materials.card, in: shape)
+                .foregroundStyle(foregroundColor)
+                .background(self.theme.materials.card, in: self.shape)
                 .background(
-                    shape
-                        .fill(theme.palette.cardBackground)
+                    self.shape
+                        .fill(self.theme.palette.cardBackground)
                         .overlay(
-                            shape.stroke(
-                                (isReady ? theme.palette.accent : theme.palette.cardBorder)
-                                    .opacity(isHovered ? 0.45 : 0.25),
+                            self.shape.stroke(
+                                border.opacity(self.isHovered ? 0.45 : 0.25),
                                 lineWidth: 1
                             )
                         )
                 )
                 .shadow(
-                    color: (isReady ? theme.palette.accent : theme.palette.cardBorder)
-                        .opacity(isHovered ? 0.3 : 0.12),
-                    radius: isHovered ? theme.metrics.cardShadow.radius - 2 : 2,
+                    color: border.opacity(self.isHovered ? 0.3 : 0.12),
+                    radius: self.isHovered ? self.theme.metrics.cardShadow.radius - 2 : 2,
                     x: 0,
-                    y: isHovered ? theme.metrics.cardShadow.y - 1 : 1
+                    y: self.isHovered ? self.theme.metrics.cardShadow.y - 1 : 1
                 )
-                .scaleEffect(configuration.isPressed ? 0.97 : (isHovered ? 1.01 : 1.0))
-                .animation(.spring(response: 0.18, dampingFraction: 0.78), value: isHovered)
-                .animation(.spring(response: 0.2, dampingFraction: 0.8), value: configuration.isPressed)
-                .onHover { isHovered = $0 }
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
+        }
+    }
+}
+
+// MARK: - Accent Filled Button (Solid accent background)
+
+struct AccentButtonStyle: ButtonStyle {
+    var compact: Bool = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        AccentButton(configuration: configuration, compact: self.compact)
+    }
+
+    private struct AccentButton: View {
+        @Environment(\.theme) private var theme
+        @State private var isHovered = false
+        let configuration: ButtonStyle.Configuration
+        let compact: Bool
+
+        private var shape: RoundedRectangle {
+            RoundedRectangle(cornerRadius: self.compact ? 8 : self.theme.metrics.corners.md, style: .continuous)
+        }
+
+        var body: some View {
+            self.configuration.label
+                .fontWeight(.semibold)
+                .padding(.horizontal, self.compact ? 12 : self.theme.metrics.spacing.lg)
+                .padding(.vertical, self.compact ? 8 : self.theme.metrics.spacing.md)
+                .frame(minHeight: self.compact ? 32 : 36)
+                .foregroundStyle(Color.white)
+                .background(
+                    self.shape
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    self.theme.palette.accent,
+                                    self.theme.palette.accent.opacity(0.85),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                )
+                .overlay(
+                    self.shape
+                        .stroke(Color.white.opacity(self.isHovered ? 0.3 : 0.15), lineWidth: 1)
+                )
+                .shadow(
+                    color: self.theme.palette.accent.opacity(self.isHovered ? 0.5 : 0.3),
+                    radius: self.isHovered ? 6 : 4,
+                    x: 0,
+                    y: self.isHovered ? 3 : 2
+                )
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
         }
     }
 }
 
 // MARK: - Inline Button
+
 struct InlineButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         InlineButton(configuration: configuration)
@@ -238,31 +381,32 @@ struct InlineButtonStyle: ButtonStyle {
         }
 
         var body: some View {
-            configuration.label
+            self.configuration.label
                 .font(.caption)
                 .fontWeight(.medium)
-                .padding(.horizontal, theme.metrics.spacing.md)
-                .padding(.vertical, theme.metrics.spacing.xs)
+                .padding(.horizontal, self.theme.metrics.spacing.md)
+                .padding(.vertical, self.theme.metrics.spacing.xs)
                 .foregroundStyle(Color.white)
                 .background(
-                    shape
-                        .fill(theme.palette.accent.opacity(isHovered ? 0.9 : 0.8))
+                    self.shape
+                        .fill(self.theme.palette.accent.opacity(self.isHovered ? 0.9 : 0.8))
                 )
                 .shadow(
-                    color: theme.palette.accent.opacity(isHovered ? 0.45 : 0.25),
-                    radius: isHovered ? 6 : 3,
+                    color: self.theme.palette.accent.opacity(self.isHovered ? 0.45 : 0.25),
+                    radius: self.isHovered ? 6 : 3,
                     x: 0,
-                    y: isHovered ? 3 : 1
+                    y: self.isHovered ? 3 : 1
                 )
-                .scaleEffect(configuration.isPressed ? 0.96 : (isHovered ? 1.03 : 1.0))
-                .animation(.easeOut(duration: 0.15), value: isHovered)
-                .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
-                .onHover { isHovered = $0 }
+                .scaleEffect(FluidInteractionVisuals.scale(isPressed: self.configuration.isPressed, isHovered: self.isHovered))
+                .animation(FluidInteractionVisuals.hoverAnimation, value: self.isHovered)
+                .animation(FluidInteractionVisuals.pressedAnimation, value: self.configuration.isPressed)
+                .onHover { self.isHovered = $0 }
         }
     }
 }
 
 // MARK: - Glass Toggle Style (now uses native switch for consistency)
+
 struct GlassToggleStyle: ToggleStyle {
     func makeBody(configuration: Configuration) -> some View {
         ToggleBody(configuration: configuration)
@@ -274,14 +418,14 @@ struct GlassToggleStyle: ToggleStyle {
 
         var body: some View {
             HStack {
-                configuration.label
-                    .foregroundStyle(theme.palette.primaryText)
+                self.configuration.label
+                    .foregroundStyle(self.theme.palette.primaryText)
 
                 Spacer()
 
-                Toggle("", isOn: configuration.$isOn)
+                Toggle("", isOn: self.configuration.$isOn)
                     .toggleStyle(.switch)
-                    .tint(theme.palette.accent)
+                    .tint(self.theme.palette.accent)
                     .labelsHidden()
             }
         }
@@ -289,19 +433,16 @@ struct GlassToggleStyle: ToggleStyle {
 }
 
 // MARK: - Native Form Row Style
+
 struct FormRowStyle: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(.ultraThinMaterial.opacity(0.5))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(.white.opacity(0.08), lineWidth: 1)
-                    )
-            )
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.ultraThinMaterial.opacity(0.5))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(.white.opacity(0.08), lineWidth: 1)))
     }
 }
 
@@ -310,13 +451,3 @@ extension View {
         modifier(FormRowStyle())
     }
 }
-
-
-
-
-
-
-
-
-
-
