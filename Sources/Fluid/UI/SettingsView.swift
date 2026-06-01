@@ -1018,10 +1018,12 @@ struct SettingsView: View {
                                     }
 
                                     SettingsStore.shared.preferredInputDeviceUID = newUID
-                                    // Only change system default if sync is enabled
-                                    if SettingsStore.shared.syncAudioDevicesWithSystem {
-                                        _ = AudioDevice.setDefaultInputDevice(uid: newUID)
-                                    }
+                                    // NOTE: We intentionally do NOT change the macOS system default
+                                    // input here. The input is held on the built-in mic by
+                                    // ASRService.enforcePinnedInputDevice (see there for why). If
+                                    // this picker also set the system default, a re-sync to a
+                                    // Bluetooth headset on (re)connect would fight that enforcement
+                                    // and could leave the input on Bluetooth. Output is unaffected.
                                 }
                                 // Sync selection when devices load or change
                                 .onChange(of: self.inputDevices) { _, newDevices in

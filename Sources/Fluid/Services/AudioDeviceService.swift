@@ -105,6 +105,35 @@ enum AudioDevice {
         return self.listInputDevices().first { $0.uid == uid }
     }
 
+    /// Returns the UID of the built-in (laptop) microphone, identified by CoreAudio's transport
+    /// type so it's robust across machines. Falls back to the conventional
+    /// "BuiltInMicrophoneDevice" UID, then to a name match. Returns nil if there's no built-in mic.
+    static func builtInInputDeviceUID() -> String? {
+        let inputs = self.listInputDevices()
+        if let device = inputs.first(where: { self.transportType($0.id) == kAudioDeviceTransportTypeBuiltIn }) {
+            return device.uid
+        }
+        if let device = inputs.first(where: { $0.uid == "BuiltInMicrophoneDevice" }) {
+            return device.uid
+        }
+        return inputs.first(where: {
+            $0.name.localizedCaseInsensitiveContains("MacBook") ||
+                $0.name.localizedCaseInsensitiveContains("Built-in")
+        })?.uid
+    }
+
+    private static func transportType(_ deviceID: AudioObjectID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr ? value : nil
+    }
+
     /// Get output device by UID without affecting system settings
     static func getOutputDevice(byUID uid: String) -> Device? {
         return self.listOutputDevices().first { $0.uid == uid }

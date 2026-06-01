@@ -208,6 +208,45 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         NotchOverlayManager.shared.setMode(mode)
     }
 
+    /// Show the recording overlay immediately on hotkey press, without waiting for
+    /// `asrService.isRunning` to flip true. The engine can take up to ~1s to (cold-)start, and
+    /// the overlay used to appear only after that; showing it now makes the widget feel instant.
+    ///
+    /// This is idempotent with the `$isRunning` observer: by marking `overlayVisible = true`
+    /// here, the later `handleOverlayState(isRunning: true)` early-returns (its
+    /// `overlayVisible != isRunning` guard fails), so we never double-present.
+    func presentRecordingOverlayNow() {
+        guard let asrService = self.asrService else { return }
+
+        // The expanded command-output notch manages its own presentation — don't disturb it.
+        if NotchOverlayManager.shared.isCommandOutputExpanded { return }
+
+        // Cancel any pending hide so a just-finished session can't yank this away.
+        self.pendingHideOperation?.cancel()
+        self.pendingHideOperation = nil
+
+        guard !self.overlayVisible else { return }
+        self.overlayVisible = true
+
+        NotchOverlayManager.shared.show(
+            audioLevelPublisher: asrService.audioLevelPublisher,
+            mode: self.currentOverlayMode
+        )
+    }
+
+    /// Roll back an instant-shown overlay if recording never actually began (e.g. the engine
+    /// failed to start or the mic isn't authorized). No-op while recording or AI-processing.
+    func dismissRecordingOverlayIfIdle() {
+        guard let asrService = self.asrService else { return }
+        if asrService.isRunning || self.isProcessingActive { return }
+
+        self.overlayVisible = false
+
+        // Leave the expanded command-output notch alone.
+        if NotchOverlayManager.shared.isCommandOutputExpanded { return }
+        NotchOverlayManager.shared.hide()
+    }
+
     func setProcessing(_ processing: Bool) {
         // Track processing state to prevent hide during AI refinement
         self.isProcessingActive = processing

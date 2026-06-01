@@ -2958,11 +2958,21 @@ extension ContentView {
         self.menuBarManager.setOverlayMode(.dictation)
 
         guard !self.asr.isRunning else { return }
+
+        // Show the widget instantly — don't wait for the audio engine to finish starting.
+        // (The engine cold-start can take up to ~1s; the overlay otherwise only appears once
+        // `asr.isRunning` flips true at the end of that.)
+        self.menuBarManager.presentRecordingOverlayNow()
+
         if SettingsStore.shared.enableTranscriptionSounds {
             TranscriptionSoundPlayer.shared.playStartSound()
         }
         Task {
             await self.asr.start()
+            // If the engine failed to start, don't leave the just-shown widget stuck on screen.
+            if !self.asr.isRunning {
+                self.menuBarManager.dismissRecordingOverlayIfIdle()
+            }
         }
     }
 

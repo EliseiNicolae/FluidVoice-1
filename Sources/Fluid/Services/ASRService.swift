@@ -485,6 +485,31 @@ final class ASRService: ObservableObject {
     private var inputFormat: AVAudioFormat?
     private var micPermissionGranted = false
 
+    // MARK: - Warm engine (fast start)
+    //
+    // Cold-starting AVAudioEngine on every hotkey press costs ~0.2–1.1s (CoreAudio HAL
+    // bring-up in engine.start()), during which the mic tap isn't installed yet — so the
+    // first word the user speaks is lost and the overlay (driven by `isRunning`) appears late.
+    //
+    // To fix this we keep the engine RUNNING with the tap installed between sessions and
+    // gate actual capture with `audioCapturePipeline.recordingEnabled`. A warm engine makes
+    // start() near-instant, so capture begins the moment the hotkey is pressed.
+    //
+    // The mic is technically active while warm (macOS shows the orange indicator), so a
+    // background idle timer releases the engine after `warmIdleTimeoutNanoseconds` of no
+    // recording, and any audio device/route change while warm also releases it (the next
+    // start then cold-starts cleanly on the new device).
+    private var isTapInstalled = false
+    private var warmIdleTeardownTask: Task<Void, Never>?
+    private let warmIdleTimeoutNanoseconds: UInt64 = 90_000_000_000 // 90s
+
+    /// True when the engine is live and capturing-ready (running with the tap installed),
+    /// whether or not we are currently recording. Used to decide the fast start path.
+    private var engineIsWarm: Bool {
+        guard let engine = self.engineStorage as? AVAudioEngine else { return false }
+        return engine.isRunning && self.isTapInstalled
+    }
+
     // Internal access for MeetingTranscriptionService to share models
     // Note: Only available when using FluidAudioProvider (Apple Silicon)
     #if arch(arm64)
@@ -588,6 +613,7 @@ final class ASRService: ObservableObject {
     }
 
     deinit {
+        self.warmIdleTeardownTask?.cancel()
         if let observer = self.vocabularyChangeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -676,8 +702,9 @@ final class ASRService: ObservableObject {
         self.registerEngineConfigurationChangeObserver()
         self.registerDeviceListChangeListener()
 
-        // Initialize device list cache
-        self.cacheCurrentDeviceList(AudioDevice.listInputDevices())
+        // If a Bluetooth headset is already the default input at launch, steer the system
+        // default back to the built-in mic so we don't start out recording from it.
+        self.enforcePinnedInputDevice(reason: "app launch")
 
         // Check if models exist on disk and auto-load if present
         // This is done in a Task to support async model detection (e.g., AppleSpeechAnalyzerProvider)
@@ -786,6 +813,10 @@ final class ASRService: ObservableObject {
         self.audioRouteRecoveryTask = nil
         self.isRecoveringAudioRoute = false
 
+        // Don't let the warm-idle timer tear the engine down out from under this session.
+        self.warmIdleTeardownTask?.cancel()
+        self.warmIdleTeardownTask = nil
+
         DebugLogger.shared.debug("🧹 Clearing buffers and state", source: "ASRService")
         self.finalText.removeAll()
         self.audioBuffer.clear(keepingCapacity: true) // specific optimization for restart
@@ -813,17 +844,14 @@ final class ASRService: ObservableObject {
         defer { self.isStarting = false }
 
         do {
-            DebugLogger.shared.debug("⚙️ Calling configureSession()...", source: "ASRService")
-            try self.configureSession()
-            DebugLogger.shared.debug("✅ configureSession() completed", source: "ASRService")
-
-            DebugLogger.shared.debug("🚀 Calling startEngine()...", source: "ASRService")
-            try self.startEngine()
-            DebugLogger.shared.debug("✅ startEngine() completed", source: "ASRService")
-
-            DebugLogger.shared.debug("🎧 Setting up engine tap...", source: "ASRService")
-            try self.setupEngineTap()
-            DebugLogger.shared.debug("✅ Engine tap setup complete", source: "ASRService")
+            // Fast path: if the engine is already warm (running with the tap installed), this
+            // returns immediately and capture begins the instant we set recordingEnabled above.
+            // Otherwise it performs the full cold bring-up (configure → start → install tap).
+            let wasWarm = self.engineIsWarm
+            DebugLogger.shared.debug("⚙️ Ensuring audio engine is running (warm=\(wasWarm))...", source: "ASRService")
+            try self.ensureEngineRunning()
+            self.benchmarkLog("engine_ready warm=\(wasWarm)")
+            DebugLogger.shared.debug("✅ Audio engine running (warm=\(wasWarm))", source: "ASRService")
 
             // Control system media AFTER successful audio setup but BEFORE setting isRunning.
             // This ensures we only act when we know recording will succeed.
@@ -865,6 +893,9 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.info("✅ START() completed successfully", source: "ASRService")
         } catch {
             DebugLogger.shared.error("Failed to start ASR session: \(error)", source: "ASRService")
+
+            // Release any partially-initialized engine so the next attempt cold-starts cleanly.
+            self.teardownEngine(reason: "start failed")
 
             // Undo any media control we applied before the failure.
             await self.restoreMediaControl(self.activeMediaControl)
@@ -964,26 +995,9 @@ final class ASRService: ObservableObject {
         self.isRunning = false
         DebugLogger.shared.debug("✅ isRunning disabled", source: "ASRService")
 
-        // Stop monitoring device to prevent callbacks after stop
-        DebugLogger.shared.debug("👁️ Stopping device monitoring...", source: "ASRService")
-        self.stopMonitoringDevice()
-        DebugLogger.shared.debug("✅ Device monitoring stopped", source: "ASRService")
-
-        // Stop the audio engine to stop new audio from coming in
-        DebugLogger.shared.debug("🎧 Removing engine tap...", source: "ASRService")
-        self.removeEngineTap()
-        DebugLogger.shared.debug("✅ Engine tap removed", source: "ASRService")
-
-        DebugLogger.shared.debug("🛑 Calling engine.stop()...", source: "ASRService")
-        self.engine.stop()
-        DebugLogger.shared.debug("✅ Engine stopped", source: "ASRService")
-
-        // Recreate the engine instance instead of calling reset() to prevent format corruption
-        // VoiceInk approach: tearing down and rebuilding ensures fresh, valid audio format on restart
-        DebugLogger.shared.debug("🗑️ Deallocating old engine and creating fresh instance...", source: "ASRService")
-        self.engineStorage = nil // Explicitly release old engine
-        // New engine will be lazily created on next access via computed property
-        DebugLogger.shared.debug("✅ Engine instance recreated", source: "ASRService")
+        // Capture above is already disabled. Keep the engine RUNNING with its tap installed so
+        // the next recording starts instantly (warm path) — a background idle timer releases it
+        // later if unused. Device monitoring stays active so a disconnect while warm is caught.
 
         // CRITICAL FIX: Await completion of streaming task AND any pending transcriptions
         // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer
@@ -992,6 +1006,9 @@ final class ASRService: ObservableObject {
         await self.stopStreamingTimerAndAwait()
         self.benchmarkLog("stop_streaming_wait elapsedMs=\(self.elapsedMilliseconds(since: streamingStopStartedAt))")
         DebugLogger.shared.debug("✅ stopStreamingTimerAndAwait() completed", source: "ASRService")
+
+        // Keep the engine warm for a fast next start (or release it if it's unhealthy).
+        self.keepEngineWarmOrTeardown()
 
         self.isProcessingChunk = false
         self.skipNextChunk = false
@@ -1147,33 +1164,20 @@ final class ASRService: ObservableObject {
         let mediaControlToRestore = self.activeMediaControl
         self.activeMediaControl = nil // Reset for next session
 
-        DebugLogger.shared.info("🛑 Stopping recording - releasing audio devices", source: "ASRService")
+        DebugLogger.shared.info("🛑 Stopping recording - keeping audio engine warm", source: "ASRService")
 
         // CRITICAL: Set isRunning to false FIRST to signal any in-flight chunks to abort early
         self.isRunning = false
         self.audioCapturePipeline.setRecordingEnabled(false)
 
-        // Stop monitoring device
-        self.stopMonitoringDevice()
-
-        self.removeEngineTap()
-        DebugLogger.shared.debug("Engine tap removed", source: "ASRService")
-
-        self.engine.stop()
-        DebugLogger.shared.debug("Engine stopped", source: "ASRService")
-
-        // Release old engine on a background thread — if the underlying device just died,
-        // AVAudioEngine deallocation can block in CoreAudio's internal teardown.
-        // No new engine is created here (it's lazy on next start()), so no overlap risk.
-        let oldEngine = self.engineStorage
-        self.engineStorage = nil
-        if let oldEngine {
-            DispatchQueue.global(qos: .utility).async { _ = oldEngine }
-        }
-
         // CRITICAL FIX: Await completion of streaming task AND any pending transcriptions
-        // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer
+        // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer.
+        // The engine keeps running (warm) here for a fast next start; device monitoring stays
+        // active so a disconnect while warm is still caught.
         await self.stopStreamingTimerAndAwait()
+
+        // Keep the engine warm for a fast next start (or release it if it's unhealthy).
+        self.keepEngineWarmOrTeardown()
 
         // NOW it's safe to clear the buffer
         self.audioBuffer.clear()
@@ -1241,6 +1245,13 @@ final class ASRService: ObservableObject {
     private func bindPreferredInputDeviceIfNeeded() -> Bool {
         DebugLogger.shared.debug("bindPreferredInputDeviceIfNeeded() - Starting input device binding", source: "ASRService")
 
+        // IMPORTANT: Do NOT bind the engine to a specific input device here. On this app's
+        // supported hardware, AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice)
+        // returns OSStatus -10851 even for the built-in mic, and the failed call leaves the
+        // input node with an invalid 0 Hz / 0 ch format so the capture tap can't be installed
+        // and recording fails entirely. We therefore always follow the macOS system default
+        // input. (See handleDefaultInputChanged for how a pinned device is kept by steering the
+        // system default instead of binding the engine.)
         guard SettingsStore.shared.syncAudioDevicesWithSystem == false else {
             DebugLogger.shared.info("Sync mode enabled - using system default input device", source: "ASRService")
             return true
@@ -1629,7 +1640,13 @@ final class ASRService: ObservableObject {
     }
 
     private func removeEngineTap() {
-        self.engine.inputNode.removeTap(onBus: 0)
+        // Use engineStorage directly so we never lazily resurrect a torn-down engine here.
+        guard let engine = self.engineStorage as? AVAudioEngine else {
+            self.isTapInstalled = false
+            return
+        }
+        engine.inputNode.removeTap(onBus: 0)
+        self.isTapInstalled = false
     }
 
     private func setupEngineTap() throws {
@@ -1690,11 +1707,96 @@ final class ASRService: ObservableObject {
         input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
             pipeline.handle(buffer: buffer)
         }
+        self.isTapInstalled = true
         DebugLogger.shared.debug("✅ setupEngineTap() - COMPLETED", source: "ASRService")
+    }
+
+    /// Brings the audio engine to a running state with the capture tap installed.
+    /// If the engine is already warm this returns immediately (the fast start path);
+    /// otherwise it performs the full cold bring-up (configure → start → install tap).
+    private func ensureEngineRunning() throws {
+        if self.engineIsWarm {
+            DebugLogger.shared.debug("♻️ Reusing warm audio engine (skipping cold start)", source: "ASRService")
+            return
+        }
+
+        DebugLogger.shared.debug("⚙️ Calling configureSession()...", source: "ASRService")
+        try self.configureSession()
+        DebugLogger.shared.debug("✅ configureSession() completed", source: "ASRService")
+
+        DebugLogger.shared.debug("🚀 Calling startEngine()...", source: "ASRService")
+        try self.startEngine()
+        DebugLogger.shared.debug("✅ startEngine() completed", source: "ASRService")
+
+        DebugLogger.shared.debug("🎧 Setting up engine tap...", source: "ASRService")
+        try self.setupEngineTap()
+        DebugLogger.shared.debug("✅ Engine tap setup complete", source: "ASRService")
+    }
+
+    /// Called after a recording stops. Keeps the engine running (warm) for an instant next
+    /// start if it's healthy, otherwise releases it. Re-arms the idle teardown timer.
+    private func keepEngineWarmOrTeardown() {
+        guard self.engineIsWarm else {
+            self.teardownEngine(reason: "engine not healthy after stop")
+            return
+        }
+        DebugLogger.shared.debug(
+            "🔥 Keeping audio engine warm for fast restart (idle release in \(self.warmIdleTimeoutNanoseconds / 1_000_000_000)s)",
+            source: "ASRService"
+        )
+        self.scheduleWarmIdleTeardown()
+    }
+
+    /// Releases the warm engine after a stretch with no recording, so the macOS mic indicator
+    /// doesn't stay on indefinitely. Re-armed on every stop; cancelled on start and teardown.
+    private func scheduleWarmIdleTeardown() {
+        self.warmIdleTeardownTask?.cancel()
+        let timeout = self.warmIdleTimeoutNanoseconds
+        self.warmIdleTeardownTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: timeout)
+            guard let self, !Task.isCancelled else { return }
+            guard self.isRunning == false, self.isStarting == false else { return }
+            DebugLogger.shared.info("💤 Warm audio engine idle timeout reached — releasing mic", source: "ASRService")
+            self.teardownEngine(reason: "warm idle timeout")
+        }
+    }
+
+    /// Fully releases the audio engine (tap, engine, device monitoring) and clears warm state.
+    /// Safe to call when nothing is running.
+    private func teardownEngine(reason: String) {
+        self.warmIdleTeardownTask?.cancel()
+        self.warmIdleTeardownTask = nil
+
+        guard self.engineStorage != nil || self.isTapInstalled else { return }
+
+        DebugLogger.shared.debug("🗑️ Tearing down audio engine (\(reason))", source: "ASRService")
+        self.stopMonitoringDevice()
+        self.removeEngineTap()
+
+        if let engine = self.engineStorage as? AVAudioEngine, engine.isRunning {
+            engine.stop()
+        }
+
+        // Release on the MAIN thread (not a background queue). Deferring the dealloc let the
+        // engine outlive AVFoundation's still-registered IO-unit property listener, which then
+        // fired on freed memory (EXC_BAD_ACCESS in AVAudioIOUnit::IOUnitPropertyListener). A
+        // synchronous main-thread release tears that listener down promptly. teardownEngine now
+        // only runs from quiet paths (stop, or the idle timer) — never from a device-change
+        // callback — so this won't block on a live device.
+        self.engineStorage = nil
+
+        self.audioLevelSubject.send(0.0)
     }
 
     private func scheduleAudioRouteRecovery(reason: String) {
         guard self.isRunning else {
+            // Not recording. We deliberately do NOT tear the warm engine down here. The input
+            // device is held on the built-in mic (see enforcePinnedInputDevice), so the warm
+            // engine's input never actually changes — only the output route might (e.g. headphones),
+            // which doesn't affect capture. Tearing the engine down on a route-change callback
+            // raced with AVFoundation's IO-unit property listener and crashed (EXC_BAD_ACCESS in
+            // AVAudioIOUnit::IOUnitPropertyListener). The warm engine is released only by the idle
+            // timer or on stop(); if a config change stops it, the next start() simply cold-starts.
             self.audioLevelSubject.send(0.0)
             return
         }
@@ -1765,13 +1867,68 @@ final class ASRService: ObservableObject {
         }
     }
 
+    /// Last time we actually *changed* the system default back to the pinned device. Only real
+    /// restores update this — no-op checks don't — so it can never swallow the restore we need.
+    /// It exists purely to break a tight loop (our own change re-firing the listener, or a
+    /// stubborn OS bouncing the input back within a fraction of a second).
+    private var lastPinnedInputRestoreAt: Date?
+    private let pinnedInputRestoreLoopGuard: TimeInterval = 0.25
+
+    /// Keep the macOS *system default* input on the **built-in (laptop) microphone**, re-asserting
+    /// it whenever something else — like a connecting/reconnecting Bluetooth headset — grabs it.
+    /// Output is untouched, so headphones still play audio; only the input is held on the laptop mic.
+    ///
+    /// FluidVoice records from the system default input. Binding the audio engine to a specific
+    /// device is impossible on this hardware (AudioUnitSetProperty returns OSStatus -10851 and
+    /// leaves the input node at 0 Hz, breaking capture), so steering the *system default* is the
+    /// only reliable way to pin the mic. This uses the same API as the settings picker.
+    ///
+    /// We deliberately target the built-in mic by CoreAudio transport type rather than
+    /// `SettingsStore.preferredInputDeviceUID`: that setting is tied to the "synced with system"
+    /// UI and gets rewritten to whatever the current default is (e.g. Bluetooth), so it can't
+    /// serve as a stable pin. No-op when the built-in mic is already the default. CoreAudio work
+    /// runs off the main thread.
+    private func enforcePinnedInputDevice(reason: String) {
+        // Tight-loop guard: skip only if we performed an ACTUAL restore a fraction of a second
+        // ago (e.g. our own change re-firing the listener). Because no-op checks never set this
+        // timestamp, the device-list-change no-op can't block the default-change restore that
+        // follows it. Legitimate reconnects are seconds apart, so they're never affected.
+        if let last = self.lastPinnedInputRestoreAt, Date().timeIntervalSince(last) < self.pinnedInputRestoreLoopGuard {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let builtInUID = AudioDevice.builtInInputDeviceUID() else {
+                DebugLogger.shared.debug("📌 Pinned input: no built-in mic found [\(reason)]", source: "ASRService")
+                return
+            }
+            // Only act if the built-in mic isn't already the default input.
+            guard let current = AudioDevice.getDefaultInputDevice(), current.uid != builtInUID else { return }
+
+            DebugLogger.shared.info(
+                "📌 Pinned input: restoring built-in mic '\(builtInUID)' over current default '\(current.name)' [\(reason)]",
+                source: "ASRService"
+            )
+            let ok = AudioDevice.setDefaultInputDevice(uid: builtInUID)
+            DebugLogger.shared.info("📌 Pinned input restore \(ok ? "succeeded" : "failed")", source: "ASRService")
+
+            // Only an actual restore arms the loop guard.
+            DispatchQueue.main.async { [weak self] in
+                self?.lastPinnedInputRestoreAt = Date()
+            }
+        }
+    }
+
     private func handleDefaultInputChanged() {
         // If we're not syncing with macOS system settings, ignore system-default changes.
-        // In independent mode, we explicitly bind to `preferredInputDeviceUID` on start/restart.
         guard SettingsStore.shared.syncAudioDevicesWithSystem else {
             DebugLogger.shared.debug("Ignoring system default input change (sync disabled)", source: "ASRService")
             return
         }
+
+        // Keep the system default on the user's pinned mic (e.g. built-in) if something grabbed it
+        // — this is what stops a reconnecting Bluetooth headset from stealing the microphone.
+        self.enforcePinnedInputDevice(reason: "default input changed")
 
         self.scheduleAudioRouteRecovery(reason: "default input changed")
     }
@@ -1960,83 +2117,12 @@ final class ASRService: ObservableObject {
         DebugLogger.shared.debug("Stopped monitoring device ID: \(deviceID)", source: "ASRService")
     }
 
-    /// Handles device list changes (new device connected or device removed)
+    /// Handles device list changes (e.g. a Bluetooth headset connecting/reconnecting). Keeps the
+    /// system default input on the built-in mic; enforcePinnedInputDevice does its CoreAudio work
+    /// off the main thread itself, so there's nothing to do here but delegate.
     private func handleDeviceListChanged() {
-        DebugLogger.shared.info("🔄 Device list changed - checking for new/removed devices", source: "ASRService")
-
-        // Perform CoreAudio queries off the main thread — during a device topology change
-        // the HAL may still be settling, and synchronous queries on main can deadlock.
-        let preferredUID = SettingsStore.shared.preferredInputDeviceUID
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let currentDevices = AudioDevice.listInputDevices()
-            let systemDefault = AudioDevice.getDefaultInputDevice()
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                let cachedUIDs = self.cachedDeviceUIDs
-
-                DebugLogger.shared.debug("Current input devices: \(currentDevices.map { $0.name }.joined(separator: ", "))", source: "ASRService")
-
-                // Check if preferred device is now available (for auto-switch)
-                if let preferredUID,
-                   let preferredDevice = currentDevices.first(where: { $0.uid == preferredUID })
-                {
-                    if let currentDevice = self.getCurrentlyBoundInputDevice(),
-                       currentDevice.uid != preferredUID,
-                       currentDevice.uid == systemDefault?.uid
-                    {
-                        DebugLogger.shared.info(
-                            "🔌 Preferred device '\(preferredDevice.name)' reconnected. Auto-switching...",
-                            source: "ASRService"
-                        )
-
-                        if self.isRunning {
-                            DebugLogger.shared.info(
-                                "Recording in progress - deferring preferred device switch until audio route recovery",
-                                source: "ASRService"
-                            )
-                            self.scheduleAudioRouteRecovery(reason: "preferred input reconnected")
-                        } else {
-                            DebugLogger.shared.info("Not recording - updating binding for next session", source: "ASRService")
-                            _ = self.setEngineInputDevice(
-                                deviceID: preferredDevice.id,
-                                deviceUID: preferredDevice.uid,
-                                deviceName: preferredDevice.name
-                            )
-                        }
-                    }
-                }
-
-                // Check for newly connected Bluetooth devices (auto-switch)
-                for device in currentDevices {
-                    if device.name.localizedCaseInsensitiveContains("airpods") ||
-                        device.name.localizedCaseInsensitiveContains("bluetooth")
-                    {
-                        if !cachedUIDs.contains(device.uid) {
-                            DebugLogger.shared.info(
-                                "🎧 New Bluetooth device detected: '\(device.name)'. Auto-switching...",
-                                source: "ASRService"
-                            )
-
-                            SettingsStore.shared.preferredInputDeviceUID = device.uid
-                            DebugLogger.shared.debug("Updated preferred input device to: \(device.uid)", source: "ASRService")
-
-                            if self.isRunning {
-                                DebugLogger.shared.info(
-                                    "Recording in progress - deferring Bluetooth switch until audio route recovery",
-                                    source: "ASRService"
-                                )
-                                self.scheduleAudioRouteRecovery(reason: "bluetooth input connected")
-                            } else {
-                                DebugLogger.shared.info("Not recording - Bluetooth device will be used on next recording", source: "ASRService")
-                            }
-                        }
-                    }
-                }
-
-                self.cacheCurrentDeviceList(currentDevices)
-            }
-        }
+        DebugLogger.shared.info("🔄 Device list changed", source: "ASRService")
+        self.enforcePinnedInputDevice(reason: "device list changed")
     }
 
     /// Handles device availability changes (device disconnected or reconnected)
@@ -2069,6 +2155,9 @@ final class ASRService: ObservableObject {
                 self.scheduleAudioRouteRecovery(reason: "monitored input disconnected")
             } else {
                 DebugLogger.shared.info("Not recording - device disconnect handled gracefully", source: "ASRService")
+                // Do not tear the warm engine down from this callback — doing so raced with
+                // AVFoundation's IO-unit listener and crashed. If the engine got stopped by the
+                // disconnect, isEngineWarm becomes false and the next start() cold-starts cleanly.
             }
         } else if status == noErr, isAlive != 0 {
             DebugLogger.shared.info("✅ Device (ID: \(deviceID)) is still alive", source: "ASRService")
@@ -2097,13 +2186,6 @@ final class ASRService: ObservableObject {
         }
 
         return nil
-    }
-
-    // Device caching for change detection
-    private var cachedDeviceUIDs: Set<String> = []
-
-    private func cacheCurrentDeviceList(_ devices: [AudioDevice.Device]) {
-        self.cachedDeviceUIDs = Set(devices.map { $0.uid })
     }
 
     // Audio tap processing is handled by AudioCapturePipeline (thread-safe).
