@@ -834,6 +834,7 @@ final class ASRService: ObservableObject {
         self.streamingChunkAnalyticsSuccessCount = 0
         self.lastStreamingChunkFailureAnalyticsAt = nil
         (self.transcriptionProvider as? FluidAudioProvider)?.resetStreamingPreviewCache()
+        self.audioCapturePipeline.setInputGain(Float(SettingsStore.shared.microphoneInputGain))
         self.audioCapturePipeline.setRecordingEnabled(true)
         self.refreshWordBoostStatus()
         let dims = self.currentTranscriptionAnalyticsDimensions()
@@ -1849,6 +1850,7 @@ final class ASRService: ObservableObject {
             try self.configureSession()
             try self.startEngine()
             try self.setupEngineTap()
+            self.audioCapturePipeline.setInputGain(Float(SettingsStore.shared.microphoneInputGain))
             self.audioCapturePipeline.setRecordingEnabled(true)
 
             if let currentDevice = self.getCurrentlyBoundInputDevice() {
@@ -2958,6 +2960,7 @@ private final class AudioCapturePipeline {
 
     private let lock = NSLock()
     private var recordingEnabled: Bool = false
+    private var inputGain: Float = 1.0
 
     // Smoothing state (kept off ASRService/@MainActor)
     private var levelHistory: [CGFloat] = []
@@ -2980,9 +2983,18 @@ private final class AudioCapturePipeline {
         }
     }
 
+    /// Software gain applied to each captured buffer. 1.0 = passthrough. Set just before
+    /// recording is enabled so a session uses a stable gain for its whole duration.
+    func setInputGain(_ gain: Float) {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        self.inputGain = max(gain, 0.0)
+    }
+
     func handle(buffer: AVAudioPCMBuffer) {
         self.lock.lock()
         let enabled = self.recordingEnabled
+        let gain = self.inputGain
         self.lock.unlock()
 
         guard enabled else {
@@ -2990,10 +3002,14 @@ private final class AudioCapturePipeline {
             return
         }
 
-        let mono16k = Self.toMono16k(floatBuffer: buffer)
+        var mono16k = Self.toMono16k(floatBuffer: buffer)
         guard mono16k.isEmpty == false else {
             self.onLevel(0.0)
             return
+        }
+
+        if gain != 1.0 {
+            Self.applyGain(&mono16k, gain: gain)
         }
 
         self.audioBuffer.append(mono16k)
@@ -3038,6 +3054,21 @@ private final class AudioCapturePipeline {
         }
 
         return self.smoothedLevel
+    }
+
+    /// Amplifies mono samples in place by `gain`, hard-clipping to [-1, 1] so the boosted
+    /// signal stays in range for downstream conversion and the speech model.
+    private static func applyGain(_ samples: inout [Float], gain: Float) {
+        guard samples.isEmpty == false else { return }
+        var multiplier = gain
+        var low: Float = -1.0
+        var high: Float = 1.0
+        let count = vDSP_Length(samples.count)
+        samples.withUnsafeMutableBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_vsmul(base, 1, &multiplier, base, 1, count)
+            vDSP_vclip(base, 1, &low, &high, base, 1, count)
+        }
     }
 
     private static func toMono16k(floatBuffer: AVAudioPCMBuffer) -> [Float] {

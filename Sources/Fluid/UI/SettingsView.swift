@@ -1046,6 +1046,51 @@ struct SettingsView: View {
                                 }
                             }
 
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Microphone Boost")
+                                            .font(.body)
+                                        Text("Amplify the mic signal before transcription. Higher can sharpen quiet speech for the model; too high will distort.")
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+
+                                    Spacer()
+
+                                    Button("Reset") {
+                                        self.settings.microphoneInputGain = 1.0
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                }
+
+                                HStack(spacing: 10) {
+                                    Text("1×")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 36, alignment: .trailing)
+
+                                    Slider(
+                                        value: self.$settings.microphoneInputGain,
+                                        in: SettingsStore.microphoneInputGainRange,
+                                        step: 0.1
+                                    )
+                                    .controlSize(.regular)
+
+                                    Text("\(Int(SettingsStore.microphoneInputGainRange.upperBound))×")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 36, alignment: .leading)
+
+                                    Text(String(format: "%.1f×", self.settings.microphoneInputGain))
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: 40)
+                                }
+                            }
+
                             HStack {
                                 Text("Output Device")
                                     .font(.body)

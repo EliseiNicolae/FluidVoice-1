@@ -50,6 +50,7 @@ struct SettingsBackupPayload: Codable, Equatable {
     let preferredInputDeviceUID: String?
     let preferredOutputDeviceUID: String?
     let visualizerNoiseThreshold: Double
+    let microphoneInputGain: Double?
     let overlayPosition: SettingsStore.OverlayPosition
     let overlayBottomOffset: Double
     let overlaySize: SettingsStore.OverlaySize

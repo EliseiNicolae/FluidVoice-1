@@ -1366,6 +1366,28 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Software gain applied to captured microphone audio before it is buffered for
+    /// transcription. 1.0 means passthrough (no change); higher values amplify the signal,
+    /// which can improve recognition when the mic input is quiet. Boosted samples are
+    /// hard-clipped to [-1, 1], so very high gains will distort and can hurt accuracy.
+    static let microphoneInputGainRange: ClosedRange<Double> = 1.0 ... 5.0
+    static let defaultMicrophoneInputGain: Double = 1.5
+
+    var microphoneInputGain: Double {
+        get {
+            guard self.defaults.object(forKey: Keys.microphoneInputGain) != nil else {
+                return Self.defaultMicrophoneInputGain
+            }
+            let value = self.defaults.double(forKey: Keys.microphoneInputGain)
+            return min(max(value, Self.microphoneInputGainRange.lowerBound), Self.microphoneInputGainRange.upperBound)
+        }
+        set {
+            objectWillChange.send()
+            let clamped = min(max(newValue, Self.microphoneInputGainRange.lowerBound), Self.microphoneInputGainRange.upperBound)
+            self.defaults.set(clamped, forKey: Keys.microphoneInputGain)
+        }
+    }
+
     // MARK: - Overlay Position
 
     /// Size options for the recording overlay
@@ -2298,6 +2320,7 @@ final class SettingsStore: ObservableObject {
             preferredInputDeviceUID: self.preferredInputDeviceUID,
             preferredOutputDeviceUID: self.preferredOutputDeviceUID,
             visualizerNoiseThreshold: self.visualizerNoiseThreshold,
+            microphoneInputGain: self.microphoneInputGain,
             overlayPosition: self.overlayPosition,
             overlayBottomOffset: self.overlayBottomOffset,
             overlaySize: self.overlaySize,
@@ -2371,6 +2394,7 @@ final class SettingsStore: ObservableObject {
         self.preferredInputDeviceUID = payload.preferredInputDeviceUID
         self.preferredOutputDeviceUID = payload.preferredOutputDeviceUID
         self.visualizerNoiseThreshold = payload.visualizerNoiseThreshold
+        self.microphoneInputGain = payload.microphoneInputGain ?? Self.defaultMicrophoneInputGain
         self.overlayPosition = payload.overlayPosition
         self.overlayBottomOffset = payload.overlayBottomOffset
         self.overlaySize = payload.overlaySize
@@ -3530,6 +3554,7 @@ private extension SettingsStore {
         static let preferredOutputDeviceUID = "PreferredOutputDeviceUID"
         static let syncAudioDevicesWithSystem = "SyncAudioDevicesWithSystem"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
+        static let microphoneInputGain = "MicrophoneInputGain"
         static let showInDock = "ShowInDock"
         static let accentColorOption = "AccentColorOption"
         static let enableTranscriptionSounds = "EnableTranscriptionSounds"
