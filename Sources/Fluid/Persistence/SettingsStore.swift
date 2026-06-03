@@ -1388,6 +1388,25 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// When enabled, the audio engine is kept warm (microphone active) indefinitely between
+    /// dictations instead of being released after the warm idle timeout. This makes recording
+    /// start instantly every time, at the cost of macOS showing the mic indicator continuously.
+    /// Default off: the mic is released automatically once it has been idle for a short while.
+    static let defaultKeepMicrophoneAlwaysOn: Bool = false
+
+    var keepMicrophoneAlwaysOn: Bool {
+        get {
+            guard self.defaults.object(forKey: Keys.keepMicrophoneAlwaysOn) != nil else {
+                return Self.defaultKeepMicrophoneAlwaysOn
+            }
+            return self.defaults.bool(forKey: Keys.keepMicrophoneAlwaysOn)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.keepMicrophoneAlwaysOn)
+        }
+    }
+
     // MARK: - Overlay Position
 
     /// Size options for the recording overlay
@@ -2321,6 +2340,7 @@ final class SettingsStore: ObservableObject {
             preferredOutputDeviceUID: self.preferredOutputDeviceUID,
             visualizerNoiseThreshold: self.visualizerNoiseThreshold,
             microphoneInputGain: self.microphoneInputGain,
+            keepMicrophoneAlwaysOn: self.keepMicrophoneAlwaysOn,
             overlayPosition: self.overlayPosition,
             overlayBottomOffset: self.overlayBottomOffset,
             overlaySize: self.overlaySize,
@@ -2395,6 +2415,7 @@ final class SettingsStore: ObservableObject {
         self.preferredOutputDeviceUID = payload.preferredOutputDeviceUID
         self.visualizerNoiseThreshold = payload.visualizerNoiseThreshold
         self.microphoneInputGain = payload.microphoneInputGain ?? Self.defaultMicrophoneInputGain
+        self.keepMicrophoneAlwaysOn = payload.keepMicrophoneAlwaysOn ?? Self.defaultKeepMicrophoneAlwaysOn
         self.overlayPosition = payload.overlayPosition
         self.overlayBottomOffset = payload.overlayBottomOffset
         self.overlaySize = payload.overlaySize
@@ -3555,6 +3576,7 @@ private extension SettingsStore {
         static let syncAudioDevicesWithSystem = "SyncAudioDevicesWithSystem"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
         static let microphoneInputGain = "MicrophoneInputGain"
+        static let keepMicrophoneAlwaysOn = "KeepMicrophoneAlwaysOn"
         static let showInDock = "ShowInDock"
         static let accentColorOption = "AccentColorOption"
         static let enableTranscriptionSounds = "EnableTranscriptionSounds"

@@ -1091,6 +1091,15 @@ struct SettingsView: View {
                                 }
                             }
 
+                            self.settingsToggleRow(
+                                title: "Keep Microphone Always On",
+                                description: "Keep the mic active between dictations so recording always starts instantly. macOS shows the mic indicator the whole time it's on. When off, the mic releases automatically after a short idle period.",
+                                isOn: self.$settings.keepMicrophoneAlwaysOn
+                            )
+                            .onChange(of: self.settings.keepMicrophoneAlwaysOn) { _, _ in
+                                self.asr.applyKeepMicrophoneAlwaysOnPreference()
+                            }
+
                             HStack {
                                 Text("Output Device")
                                     .font(.body)

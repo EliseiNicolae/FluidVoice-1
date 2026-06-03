@@ -1752,6 +1752,16 @@ final class ASRService: ObservableObject {
     /// doesn't stay on indefinitely. Re-armed on every stop; cancelled on start and teardown.
     private func scheduleWarmIdleTeardown() {
         self.warmIdleTeardownTask?.cancel()
+        self.warmIdleTeardownTask = nil
+
+        // User opted to force the microphone on: keep the warm engine alive indefinitely so the
+        // next recording always starts instantly. The engine is then released only on quit or
+        // when the user turns this off (see applyKeepMicrophoneAlwaysOnPreference).
+        guard SettingsStore.shared.keepMicrophoneAlwaysOn == false else {
+            DebugLogger.shared.debug("🎙️ Keep microphone always on — skipping warm idle teardown", source: "ASRService")
+            return
+        }
+
         let timeout = self.warmIdleTimeoutNanoseconds
         self.warmIdleTeardownTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: timeout)
@@ -1759,6 +1769,22 @@ final class ASRService: ObservableObject {
             guard self.isRunning == false, self.isStarting == false else { return }
             DebugLogger.shared.info("💤 Warm audio engine idle timeout reached — releasing mic", source: "ASRService")
             self.teardownEngine(reason: "warm idle timeout")
+        }
+    }
+
+    /// Applies the "keep microphone always on" preference the moment the user toggles it.
+    /// Turning it ON cancels any pending idle release so a currently-warm engine stays warm.
+    /// Turning it OFF re-arms the idle release if the engine is warm and not in use, so the
+    /// mic indicator clears after the normal idle timeout. Does nothing if the engine is cold —
+    /// it simply warms on the next recording and then stays warm while the preference is on.
+    func applyKeepMicrophoneAlwaysOnPreference() {
+        if SettingsStore.shared.keepMicrophoneAlwaysOn {
+            self.warmIdleTeardownTask?.cancel()
+            self.warmIdleTeardownTask = nil
+            DebugLogger.shared.info("🎙️ Keep microphone always on enabled — warm engine will not idle-release", source: "ASRService")
+        } else if self.engineIsWarm, self.isRunning == false, self.isStarting == false {
+            DebugLogger.shared.info("🎙️ Keep microphone always on disabled — re-arming warm idle release", source: "ASRService")
+            self.scheduleWarmIdleTeardown()
         }
     }
 
