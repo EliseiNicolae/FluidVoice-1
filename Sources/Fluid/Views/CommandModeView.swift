@@ -583,6 +583,7 @@ struct CommandModeView: View {
         if self.asr.isRunning {
             Task {
                 let command = await self.asr.stop().trimmingCharacters(in: .whitespacesAndNewlines)
+                _ = self.asr.consumeLastCompletedAudioSnapshot()
                 guard !command.isEmpty else { return }
                 await MainActor.run {
                     self.inputText = command

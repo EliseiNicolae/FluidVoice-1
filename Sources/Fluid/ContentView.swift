@@ -138,6 +138,7 @@ struct ContentView: View {
     @State private var promptModeOverrideText: String? // System prompt text to use when in prompt mode
     @State private var activeDictationShortcutSlot: SettingsStore.DictationShortcutSlot? = nil
     @State private var activeRecordingMode: ActiveRecordingMode = .none
+    @State private var pendingAIReprocessText: String? = nil
     @State private var activeShortcutRecordingTarget: ShortcutRecordingTarget? = nil
     @State private var currentRecordingModifierKeyCodes: Set<UInt16> = []
     @State private var pendingModifierKeyCodes: Set<UInt16> = []
@@ -1572,9 +1573,50 @@ struct ContentView: View {
 
         DebugLogger.shared.debug("processTextWithAI using provider=\(derivedCurrentProvider), model=\(derivedSelectedModel)", source: "ContentView")
 
+        let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
+        let isDictationCall = overrideSystemPrompt != nil || dictationSlot != nil
+        let isPrivateAIProvider = currentSelectedProviderID == PrivateAIProviderFeature.shared.providerID ||
+            derivedCurrentProvider == PrivateAIProviderFeature.shared.providerID ||
+            derivedCurrentProvider == "custom:\(PrivateAIProviderFeature.shared.providerID)"
+        let usePrivateAIProvider = overrideSystemPrompt == nil &&
+            isDictationCall &&
+            (isPrivateAIProvider || PrivateAIIntegrationService.shouldHandleDictation(model: derivedSelectedModel))
+
+        if usePrivateAIProvider {
+            if self.shouldTracePromptProcessing {
+                self.logDictationPromptTrace("Private AI Provider task", value: "dictationEnhancement")
+                self.logDictationPromptTrace("Input transcription (Q)", value: inputText)
+                self.logDictationPromptTrace("Selected context text", value: "<none (dictation mode)>")
+            }
+
+            let apiKey = storedProviderAPIKeys[derivedCurrentProvider] ?? storedProviderAPIKeys[currentSelectedProviderID] ?? ""
+            let response = try await PrivateAIIntegrationService.shared.enhanceDictation(
+                inputText,
+                runtime: PrivateAIIntegrationService.RuntimeConfiguration(
+                    selectedProviderID: currentSelectedProviderID,
+                    providerKey: derivedCurrentProvider,
+                    baseURL: derivedBaseURL,
+                    model: derivedSelectedModel,
+                    apiKey: apiKey,
+                    localModelPath: PrivateAIIntegrationService.configuredLocalModelPath,
+                    usesStablePromptPrefixKVCache: SettingsStore.shared.privateAIPrefixKVCacheEnabled
+                ),
+                context: PrivateAIIntegrationService.AppContext(
+                    appName: appInfo.name,
+                    bundleID: appInfo.bundleId,
+                    windowTitle: appInfo.windowTitle,
+                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                )
+            )
+
+            if self.shouldTracePromptProcessing {
+                self.logDictationPromptTrace("Model answer (A)", value: response.outputText)
+            }
+            return response.outputText
+        }
+
         // Resolve the effective prompt once so every provider path honors
         // transient overrides such as "Transcribe with Prompt".
-        let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let promptText: String = {
             let override = overrideSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !override.isEmpty { return override }
@@ -1586,8 +1628,6 @@ struct ContentView: View {
         // the transcript after a blank line). Non-dictation callers — the AI
         // chat tab specifically — keep the legacy two-message layout where
         // the prompt is the system turn and the input is the user turn.
-        let isDictationCall = overrideSystemPrompt != nil || dictationSlot != nil
-
         let systemPrompt: String
         let userMessageContent: String
         if isDictationCall {
@@ -1801,6 +1841,7 @@ struct ContentView: View {
         // Stop the ASR service and wait for transcription to complete
         // The processing indicator will stay visible during this phase
         let transcribedText = await asr.stop()
+        let audioSnapshot = self.asr.consumeLastCompletedAudioSnapshot()
         DebugLogger.shared.info(
             "Stop transcription result | chars=\(transcribedText.count) | empty=\(transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
             source: "ContentView"
@@ -1978,13 +2019,30 @@ struct ContentView: View {
 
         // Save to transcription history (transcription mode only, if enabled)
         if shouldPersistOutputs, SettingsStore.shared.saveTranscriptionHistory {
+            let historyEntryID = UUID()
+            let historyTimestamp = Date()
             TranscriptionHistoryStore.shared.addEntry(
+                id: historyEntryID,
+                timestamp: historyTimestamp,
                 rawText: transcribedText,
                 processedText: finalText,
                 appName: appInfo.name,
                 windowTitle: appInfo.windowTitle,
                 aiProcessingError: aiFallbackReason
             )
+            self.persistDictationAudioIfNeeded(
+                audioSnapshot,
+                entryID: historyEntryID,
+                timestamp: historyTimestamp,
+                model: transcriptionModelInfo.model
+            )
+        }
+        let shouldShowAIProcessingFailure = shouldPersistOutputs && aiFallbackReason != nil
+        if shouldShowAIProcessingFailure {
+            self.pendingAIReprocessText = transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+        } else {
+            self.pendingAIReprocessText = nil
         }
 
         // When FluidVoice itself is frontmost, the bound editor already receives `finalText`.
@@ -2047,7 +2105,9 @@ struct ContentView: View {
                 aiProvider: modelInfo.provider
             )
 
-            NotchOverlayManager.shared.hide()
+            if !shouldShowAIProcessingFailure {
+                NotchOverlayManager.shared.hide()
+            }
         } else if shouldPersistOutputs,
                   SettingsStore.shared.copyTranscriptionToClipboard == false,
                   SettingsStore.shared.saveTranscriptionHistory
@@ -2061,8 +2121,46 @@ struct ContentView: View {
             )
         }
 
-        if !didTypeExternally {
+        if !didTypeExternally, !shouldShowAIProcessingFailure {
             NotchOverlayManager.shared.hide()
+        }
+    }
+
+    private func persistDictationAudioIfNeeded(
+        _ snapshot: DictationAudioSnapshot?,
+        entryID: UUID,
+        timestamp: Date,
+        model: String
+    ) {
+        guard SettingsStore.shared.saveTranscriptionHistory,
+              SettingsStore.shared.saveAudioWithTranscriptionHistory,
+              let snapshot = snapshot
+        else {
+            return
+        }
+
+        Task.detached(priority: .utility) {
+            let result: (metadata: DictationAudioMetadata?, error: String?) = {
+                do {
+                    let metadata = try DictationAudioHistoryStore.shared.save(
+                        snapshot: snapshot,
+                        entryID: entryID,
+                        timestamp: timestamp,
+                        model: model
+                    )
+                    return (metadata, nil)
+                } catch {
+                    return (nil, error.localizedDescription)
+                }
+            }()
+
+            await MainActor.run {
+                if let metadata = result.metadata {
+                    TranscriptionHistoryStore.shared.attachAudio(metadata, to: entryID)
+                } else if let error = result.error {
+                    DebugLogger.shared.error("Failed to save dictation audio: \(error)", source: "ContentView")
+                }
+            }
         }
     }
 
@@ -2078,7 +2176,17 @@ struct ContentView: View {
         return .normal
     }
 
-    private func reprocessLastDictationFromHistory() {
+    private func reprocessLastDictation() {
+        if let pendingText = self.pendingAIReprocessText?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !pendingText.isEmpty
+        {
+            DebugLogger.shared.info("Actions: Reprocessing pending failed dictation", source: "ContentView")
+            Task { @MainActor in
+                await self.reprocessDictationText(pendingText)
+            }
+            return
+        }
+
         guard let last = TranscriptionHistoryStore.shared.entries.first else {
             DebugLogger.shared.info("Actions: Reprocess requested but history is empty", source: "ContentView")
             return
@@ -2202,7 +2310,10 @@ struct ContentView: View {
         let shouldUseAI = DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId)
         if shouldUseAI {
             do {
-                finalText = try await self.processTextWithAI(transcribedText)
+                finalText = try await self.processTextWithAI(
+                    transcribedText,
+                    dictationSlot: .primary
+                )
             } catch {
                 DebugLogger.shared.error(
                     "AI reprocess failed, falling back to raw transcription: \(error.localizedDescription)",
@@ -2227,6 +2338,12 @@ struct ContentView: View {
                 windowTitle: appInfo.windowTitle,
                 aiProcessingError: aiFallbackReason
             )
+        }
+        if aiFallbackReason != nil {
+            self.pendingAIReprocessText = transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+        } else {
+            self.pendingAIReprocessText = nil
         }
 
         if SettingsStore.shared.copyTranscriptionToClipboard {
@@ -2558,7 +2675,7 @@ struct ContentView: View {
             self.handleLiveOverlayModeSwitch(mode)
         }
         NotchContentState.shared.onReprocessLastRequested = {
-            self.reprocessLastDictationFromHistory()
+            self.reprocessLastDictation()
         }
         NotchContentState.shared.onCopyLastRequested = {
             self.copyLastDictationFromHistory()
@@ -2573,6 +2690,15 @@ struct ContentView: View {
             _ = self.handleCancelShortcut()
         }
         NotchContentState.shared.onDictationPromptSelectionRequested = { selection in
+            let privateAIAvailable = PrivateAIProviderPromptFormat.isAvailable()
+            switch selection {
+            case .off:
+                break
+            case .privateAI:
+                guard privateAIAvailable else { return }
+            case .default, .profile:
+                guard !privateAIAvailable else { return }
+            }
             let slot = self.activeDictationShortcutSlot ?? .primary
             SettingsStore.shared.setDictationPromptSelection(selection, for: slot)
             self.applyDictationShortcutSelectionContext(for: slot)
@@ -2929,6 +3055,10 @@ extension ContentView {
             self.promptModeOverrideText = nil
             NotchContentState.shared.promptModeOverrideProfileName = nil
             NotchContentState.shared.promptModeOverrideProfileID = nil
+        case .privateAI:
+            self.promptModeOverrideText = nil
+            NotchContentState.shared.promptModeOverrideProfileName = PrivateAIProviderFeature.displayName
+            NotchContentState.shared.promptModeOverrideProfileID = PrivateAIProviderPromptFormat.promptSelectionID
         case let .profile(profileID):
             guard let profile = settings.selectedDictationPromptProfile(for: slot) ?? settings.dictationPromptProfiles.first(where: {
                 $0.id == profileID && $0.mode.normalized == .dictate

@@ -23,6 +23,7 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
     /// back to typing the raw transcription. The string carries the error
     /// message for display / debugging.
     let aiProcessingError: String?
+    let audio: DictationAudioMetadata?
 
     init(
         id: UUID = UUID(),
@@ -31,7 +32,8 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         processedText: String,
         appName: String,
         windowTitle: String,
-        aiProcessingError: String? = nil
+        aiProcessingError: String? = nil,
+        audio: DictationAudioMetadata? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -42,6 +44,31 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = processedText.count
         self.wasAIProcessed = rawText != processedText
         self.aiProcessingError = aiProcessingError
+        self.audio = audio
+    }
+
+    private init(
+        id: UUID,
+        timestamp: Date,
+        rawText: String,
+        processedText: String,
+        appName: String,
+        windowTitle: String,
+        characterCount: Int,
+        wasAIProcessed: Bool,
+        aiProcessingError: String?,
+        audio: DictationAudioMetadata?
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.rawText = rawText
+        self.processedText = processedText
+        self.appName = appName
+        self.windowTitle = windowTitle
+        self.characterCount = characterCount
+        self.wasAIProcessed = wasAIProcessed
+        self.aiProcessingError = aiProcessingError
+        self.audio = audio
     }
 
     init(from decoder: Decoder) throws {
@@ -55,11 +82,12 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = try container.decode(Int.self, forKey: .characterCount)
         self.wasAIProcessed = try container.decode(Bool.self, forKey: .wasAIProcessed)
         self.aiProcessingError = try container.decodeIfPresent(String.self, forKey: .aiProcessingError)
+        self.audio = try container.decodeIfPresent(DictationAudioMetadata.self, forKey: .audio)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, rawText, processedText, appName, windowTitle
-        case characterCount, wasAIProcessed, aiProcessingError
+        case characterCount, wasAIProcessed, aiProcessingError, audio
     }
 
     /// Preview text for list display (first 80 chars)
@@ -84,6 +112,25 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter.string(from: self.timestamp)
+    }
+
+    var hasAudioMetadata: Bool {
+        self.audio != nil
+    }
+
+    func replacingAudio(_ audio: DictationAudioMetadata?) -> TranscriptionHistoryEntry {
+        TranscriptionHistoryEntry(
+            id: self.id,
+            timestamp: self.timestamp,
+            rawText: self.rawText,
+            processedText: self.processedText,
+            appName: self.appName,
+            windowTitle: self.windowTitle,
+            characterCount: self.characterCount,
+            wasAIProcessed: self.wasAIProcessed,
+            aiProcessingError: self.aiProcessingError,
+            audio: audio
+        )
     }
 }
 
@@ -116,33 +163,45 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Add a new transcription entry
     func addEntry(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
         rawText: String,
         processedText: String,
         appName: String,
         windowTitle: String,
-        aiProcessingError: String? = nil
+        aiProcessingError: String? = nil,
+        audio: DictationAudioMetadata? = nil
     ) {
         // Skip empty transcriptions
         guard !processedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         let entry = TranscriptionHistoryEntry(
+            id: id,
+            timestamp: timestamp,
             rawText: rawText,
             processedText: processedText,
             appName: appName,
             windowTitle: windowTitle,
-            aiProcessingError: aiProcessingError
+            aiProcessingError: aiProcessingError,
+            audio: audio
         )
 
         // Insert at beginning (newest first)
         self.entries.insert(entry, at: 0)
 
         self.saveEntries()
+        if audio != nil {
+            self.pruneAudioToBudget()
+        }
 
         DebugLogger.shared.debug("Added transcription to history (total: \(self.entries.count))", source: "TranscriptionHistoryStore")
     }
 
     /// Delete a specific entry
     func deleteEntry(id: UUID) {
+        if let audio = self.entries.first(where: { $0.id == id })?.audio {
+            DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+        }
         self.entries.removeAll { $0.id == id }
 
         // Clear selection if deleted
@@ -155,6 +214,11 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Delete multiple entries
     func deleteEntries(ids: Set<UUID>) {
+        for entry in self.entries where ids.contains(entry.id) {
+            if let audio = entry.audio {
+                DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+            }
+        }
         self.entries.removeAll { ids.contains($0.id) }
 
         if let selected = selectedEntryID, ids.contains(selected) {
@@ -166,6 +230,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Clear all history
     func clearAllHistory() {
+        DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         self.entries.removeAll()
         self.selectedEntryID = nil
         self.saveEntries()
@@ -211,6 +276,65 @@ final class TranscriptionHistoryStore: ObservableObject {
         self.entries = payload.sorted { $0.timestamp > $1.timestamp }
         self.selectedEntryID = self.entries.first?.id
         self.saveEntries()
+    }
+
+    func attachAudio(_ audio: DictationAudioMetadata, to entryID: UUID) {
+        guard let index = self.entries.firstIndex(where: { $0.id == entryID }) else {
+            DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+            return
+        }
+        self.entries[index] = self.entries[index].replacingAudio(audio)
+        self.saveEntries()
+        self.pruneAudioToBudget()
+    }
+
+    @discardableResult
+    func deleteAllSavedAudio() -> Int {
+        let removedCount = self.entries.filter { $0.audio != nil }.count
+        DictationAudioHistoryStore.shared.deleteAllAudioFiles()
+        self.entries = self.entries.map { $0.replacingAudio(nil) }
+        self.saveEntries()
+        DebugLogger.shared.info("Deleted saved dictation audio (\(removedCount) entries)", source: "TranscriptionHistoryStore")
+        return removedCount
+    }
+
+    @discardableResult
+    func pruneAudioToBudget() -> Int {
+        let budgetBytes = SettingsStore.shared.audioHistoryBudgetBytes
+        guard budgetBytes > 0 else {
+            return self.deleteAllSavedAudio()
+        }
+
+        var currentBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        guard currentBytes > budgetBytes else { return 0 }
+
+        var updatedEntries = self.entries
+        let referencedFileNames = Set(updatedEntries.compactMap { $0.audio?.fileName })
+        let orphanedAudio = DictationAudioHistoryStore.shared.deleteUnreferencedAudioFiles(referencedFileNames: referencedFileNames)
+        if orphanedAudio.fileCount > 0 {
+            currentBytes = max(0, currentBytes - orphanedAudio.byteCount)
+            DebugLogger.shared.info("Pruned orphaned dictation audio (\(orphanedAudio.fileCount) files)", source: "TranscriptionHistoryStore")
+        }
+        guard currentBytes > budgetBytes else { return 0 }
+
+        var prunedCount = 0
+        for index in updatedEntries.indices.reversed() {
+            guard let audio = updatedEntries[index].audio else { continue }
+            let removedBytes = DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+            currentBytes = max(0, currentBytes - removedBytes)
+            updatedEntries[index] = updatedEntries[index].replacingAudio(nil)
+            prunedCount += 1
+            if currentBytes <= budgetBytes {
+                break
+            }
+        }
+
+        if prunedCount > 0 {
+            self.entries = updatedEntries
+            self.saveEntries()
+            DebugLogger.shared.info("Pruned saved dictation audio (\(prunedCount) entries)", source: "TranscriptionHistoryStore")
+        }
+        return prunedCount
     }
 
     // MARK: - Private Methods

@@ -42,7 +42,6 @@ final class FluidAudioProvider: TranscriptionProvider {
     /// Used for downloading specific models without changing the active selection.
     var modelOverride: SettingsStore.SpeechModel?
     private let configureWordBoosting: Bool
-
     init(modelOverride: SettingsStore.SpeechModel? = nil, configureWordBoosting: Bool = true) {
         self.modelOverride = modelOverride
         self.configureWordBoosting = configureWordBoosting

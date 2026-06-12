@@ -1284,6 +1284,10 @@ private struct BottomOverlayPromptMenuView: View {
     let onDismissRequested: () -> Void
     @State private var hoveredRowID: String?
 
+    private var privateAILocked: Bool {
+        self.promptMode.normalized == .dictate && PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
+    }
+
     private func rowBackground(isSelected: Bool, rowID: String) -> some View {
         let isHovered = self.hoveredRowID == rowID
         let fillColor: Color
@@ -1346,10 +1350,11 @@ private struct BottomOverlayPromptMenuView: View {
     @ViewBuilder
     private func defaultRow(selectedID: String?) -> some View {
         let activeSlot = self.contentState.activeDictationShortcutSlot ?? .primary
-        let isSelected = self.promptMode.normalized == .dictate
+        let isSelected = !self.privateAILocked && (self.promptMode.normalized == .dictate
             ? (self.settings.dictationPromptSelection(for: activeSlot) == .default)
-            : (selectedID == nil)
+            : (selectedID == nil))
         Button(action: {
+            guard !self.privateAILocked else { return }
             if self.promptMode.normalized == .dictate {
                 self.contentState.onDictationPromptSelectionRequested?(.default)
             } else {
@@ -1371,18 +1376,53 @@ private struct BottomOverlayPromptMenuView: View {
             .background(self.rowBackground(isSelected: isSelected, rowID: "default"))
         }
         .buttonStyle(.plain)
+        .disabled(self.privateAILocked)
+        .opacity(self.privateAILocked ? 0.45 : 1)
         .onHover { hovering in
-            self.hoveredRowID = hovering ? "default" : nil
+            self.hoveredRowID = hovering && !self.privateAILocked ? "default" : nil
+        }
+    }
+
+    @ViewBuilder
+    private func privateAIRow() -> some View {
+        let activeSlot = self.contentState.activeDictationShortcutSlot ?? .primary
+        let isAvailable = PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
+        let isSelected = self.settings.dictationPromptSelection(for: activeSlot) == .privateAI
+        Button(action: {
+            guard isAvailable else { return }
+            self.contentState.onDictationPromptSelectionRequested?(.privateAI)
+            self.restoreTypingTargetApp()
+            self.onDismissRequested()
+        }) {
+            HStack {
+                Text(PrivateAIProviderFeature.displayName)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(self.rowBackground(isSelected: isSelected, rowID: PrivateAIProviderFeature.shared.providerID))
+        }
+        .buttonStyle(.plain)
+        .disabled(!isAvailable)
+        .opacity(isAvailable ? 1 : 0.45)
+        .help(isAvailable ? "Use \(PrivateAIProviderFeature.displayName)" : "Select \(PrivateAIProviderFeature.displayName) to enable this prompt")
+        .onHover { hovering in
+            self.hoveredRowID = hovering && isAvailable ? PrivateAIProviderFeature.shared.providerID : nil
         }
     }
 
     @ViewBuilder
     private func profileRow(_ profile: SettingsStore.DictationPromptProfile, selectedID: String?) -> some View {
         let activeSlot = self.contentState.activeDictationShortcutSlot ?? .primary
-        let isSelected = self.promptMode.normalized == .dictate
+        let isSelected = !self.privateAILocked && (self.promptMode.normalized == .dictate
             ? (self.settings.dictationPromptSelection(for: activeSlot) == .profile(profile.id))
-            : (selectedID == profile.id)
+            : (selectedID == profile.id))
         Button(action: {
+            guard !self.privateAILocked else { return }
             if self.promptMode.normalized == .dictate {
                 self.contentState.onDictationPromptSelectionRequested?(.profile(profile.id))
             } else {
@@ -1404,8 +1444,10 @@ private struct BottomOverlayPromptMenuView: View {
             .background(self.rowBackground(isSelected: isSelected, rowID: profile.id))
         }
         .buttonStyle(.plain)
+        .disabled(self.privateAILocked)
+        .opacity(self.privateAILocked ? 0.45 : 1)
         .onHover { hovering in
-            self.hoveredRowID = hovering ? profile.id : nil
+            self.hoveredRowID = hovering && !self.privateAILocked ? profile.id : nil
         }
     }
 
@@ -1421,9 +1463,15 @@ private struct BottomOverlayPromptMenuView: View {
                     .padding(.vertical, 4)
             }
 
-            self.defaultRow(selectedID: selectedID)
+            if !self.privateAILocked {
+                self.defaultRow(selectedID: selectedID)
+            }
 
-            if !profiles.isEmpty {
+            if self.promptMode.normalized == .dictate && PrivateFeatures.privateAIProvider {
+                self.privateAIRow()
+            }
+
+            if !self.privateAILocked && !profiles.isEmpty {
                 Divider()
                     .padding(.vertical, 4)
 
@@ -2076,12 +2124,17 @@ struct BottomOverlayView: View {
         self.shouldReservePreviewArea && self.contentState.isProcessing && self.processingStatusVisible
     }
 
+    private var shouldShowAIProcessingFailure: Bool {
+        self.shouldReservePreviewArea && self.contentState.isAIProcessingFailureVisible && !self.contentState.isProcessing
+    }
+
     private var shouldSuppressPreviewDuringRelease: Bool {
         self.contentState.isBottomOverlayReleaseTransitioning || self.contentState.isBottomOverlayDismissing
     }
 
     private func previewResizeBucket(for previewText: String) -> Int {
         guard self.shouldReservePreviewArea else { return 0 }
+        if self.shouldShowAIProcessingFailure { return 1 }
         let trimmed = previewText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return self.shouldShowProcessingStatus ? 1 : 0 }
 
@@ -2487,6 +2540,44 @@ struct BottomOverlayView: View {
         .help("Open Preferences")
     }
 
+    private func failureIconButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: max(self.layout.transFontSize - 1, 10), weight: .semibold))
+                .foregroundStyle(.white.opacity(0.86))
+                .frame(width: 20, height: 20)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.12))
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var aiProcessingFailureView: some View {
+        HStack(spacing: 8) {
+            Text("AI Enhancement failed")
+                .font(.system(size: self.layout.transFontSize, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 4)
+
+            self.failureIconButton(systemName: "arrow.clockwise", help: "Try again") {
+                self.contentState.clearAIProcessingFailure()
+                self.contentState.onReprocessLastRequested?()
+            }
+
+            self.failureIconButton(systemName: "xmark", help: "Dismiss") {
+                self.contentState.clearAIProcessingFailure()
+                NotchOverlayManager.shared.hide()
+            }
+        }
+        .frame(maxWidth: self.previewMaxWidth, alignment: .leading)
+    }
+
     var body: some View {
         VStack(spacing: max(4, self.layout.vPadding / 2)) {
             if self.layout.showsTopControls {
@@ -2510,6 +2601,8 @@ struct BottomOverlayView: View {
                         Group {
                             if self.shouldSuppressPreviewDuringRelease {
                                 Color.clear
+                            } else if self.shouldShowAIProcessingFailure {
+                                self.aiProcessingFailureView
                             } else if self.shouldShowProcessingStatus {
                                 // Temporarily hidden; the waveform sweep carries processing state.
                                 // ShimmerText(
@@ -2566,6 +2659,8 @@ struct BottomOverlayView: View {
                         Group {
                             if self.shouldSuppressPreviewDuringRelease {
                                 Color.clear
+                            } else if self.shouldShowAIProcessingFailure {
+                                self.aiProcessingFailureView
                             } else if self.hasTranscription && !self.contentState.isProcessing {
                                 let previewText = self.transcriptionPreviewText
                                 if !previewText.isEmpty {
@@ -2793,6 +2888,10 @@ struct BottomOverlayView: View {
             if !self.layout.usesFixedCanvas {
                 self.refreshDynamicPreviewSizeIfNeeded(for: self.currentPreviewSizingText)
             }
+        }
+        .onChange(of: self.contentState.isAIProcessingFailureVisible) { _, _ in
+            guard !self.layout.usesFixedCanvas else { return }
+            self.refreshDynamicPreviewSizeIfNeeded(for: self.currentPreviewSizingText)
         }
         .onChange(of: self.processingStatusVisible) { _, _ in
             guard !self.layout.usesFixedCanvas else { return }

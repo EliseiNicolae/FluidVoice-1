@@ -1650,6 +1650,7 @@ struct OnboardingFlowView: View {
         Task { @MainActor in
             if self.asr.isRunning {
                 let transcribed = await self.asr.stop()
+                _ = self.asr.consumeLastCompletedAudioSnapshot()
                 self.asr.finalText = ASRService.applyGAAVFormatting(transcribed)
                 if !self.asr.finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.markPlaygroundValidated()

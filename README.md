@@ -1,8 +1,10 @@
 # FluidVoice
 
-[![Supported Models](https://img.shields.io/badge/Models-Parakeet%20Flash%20%7C%20Parakeet%20v3%20%26%20v2%20%7C%20Cohere%20Transcribe%20%7C%20Apple%20Speech%20%7C%20Whisper-blue)](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)
+[![Supported Models](https://img.shields.io/badge/Models-Nemotron%20Speech%203.5%20%7C%20Parakeet%20Flash%20%7C%20Parakeet%20v3%20%26%20v2%20%7C%20Cohere%20%7C%20Apple%20Speech%20%7C%20Whisper-blue)](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)
 
 Fully open source voice-to-text dictation app for macOS with AI enhancement.
+
+**Day-0 NVIDIA Nemotron Speech 3.5 support for macOS dictation.** FluidVoice is one of the first dictation apps to support Nemotron Speech 3.5 streaming-capable transcription, bringing NVIDIA's latest speech models into a native Apple Silicon workflow.
 
 **Install with Homebrew:** `brew install --cask fluidvoice`
 
@@ -13,9 +15,9 @@ Fully open source voice-to-text dictation app for macOS with AI enhancement.
 
 ## Latest Update
 
-- Added **[Parakeet Flash (Beta)](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)** for low-latency live English dictation on Apple Silicon
-- Added **Cohere Transcribe** support for higher-accuracy multilingual dictation on Apple Silicon
-- Expanded the voice engine lineup with **Parakeet Flash, Parakeet v3/v2, Cohere, Apple Speech, and Whisper**
+- Added **NVIDIA Nemotron Speech 3.5** support on day 0, including **Nemotron 3.5 Multilingual** and **Nemotron Speech 3.5 Ultra Fast Low Latency** for Apple Silicon
+- FluidVoice is one of the first dictation apps to support **Nemotron Speech 3.5 streaming-capable transcription** in a native macOS workflow
+- Expanded the voice engine lineup with **Nemotron, Parakeet Flash, Parakeet v3/v2, Cohere, Apple Speech, and Whisper**
 
 ## Star History
 
@@ -57,7 +59,7 @@ https://github.com/user-attachments/assets/c57ef6d5-f0a1-4a3f-a121-637533442c24
 
 ## Features
 - **Live Preview Mode**: Real-time transcription preview in overlay
-- **Multiple Speech Models**: Parakeet Flash, Parakeet TDT v3 & v2, Cohere Transcribe, Apple Speech, and Whisper
+- **Multiple Speech Models**: Nemotron Speech 3.5, Parakeet Flash, Parakeet TDT v3 & v2, Cohere Transcribe, Apple Speech, and Whisper
 - **Real-time transcription** with extremely low latency
 - **AI enhancement** with OpenAI, Groq, and custom providers
 - **Global hotkey** for instant voice capture
@@ -70,6 +72,8 @@ https://github.com/user-attachments/assets/c57ef6d5-f0a1-4a3f-a121-637533442c24
 
 | Model | Best for | Language support | Download size | Hardware |
 | --- | --- | --- | --- | --- |
+| Nemotron Speech 3.5 - Ultra Fast Low Latency | Streaming-capable multilingual dictation | Around 40 languages | ~670 MB | Apple Silicon |
+| Nemotron 3.5 Multilingual | Slower but more accurate multilingual dictation | Around 40 languages | ~530 MB | Apple Silicon |
 | [Parakeet Flash (Beta)](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) | Lowest-latency live English dictation | English only | ~250 MB | Apple Silicon |
 | Parakeet TDT v3 | Fast default multilingual dictation | [25 languages](#parakeet-tdt-v3-languages) | ~500 MB | Apple Silicon |
 | Parakeet TDT v2 | Fastest English-only dictation | [English only](#parakeet-tdt-v2-languages) | ~500 MB | Apple Silicon |
@@ -78,7 +82,7 @@ https://github.com/user-attachments/assets/c57ef6d5-f0a1-4a3f-a121-637533442c24
 | Whisper Tiny / Base / Small / Medium / Large | Broad compatibility, including Intel Macs | [99 languages](#whisper-language-support) | ~75 MB to ~2.9 GB | Apple Silicon + Intel |
 
 Notes:
-Parakeet Flash is the best pick when you want words to appear live with the lowest latency. Parakeet TDT v3 remains the default multilingual Apple Silicon model. Cohere is the stronger pick if you want a larger multilingual model with higher displayed accuracy. Whisper remains the fallback for Intel Macs and the widest language coverage.
+Nemotron Speech 3.5 Ultra Fast Low Latency is the newest Apple Silicon option for streaming-capable multilingual dictation. Nemotron 3.5 Multilingual is slower but tuned for higher accuracy. Parakeet Flash is the best pick when you want English words to appear live with the lowest latency. Whisper remains the fallback for Intel Macs and the widest language coverage.
 
 ### Parakeet Flash Languages
 

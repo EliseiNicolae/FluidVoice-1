@@ -275,53 +275,6 @@ extension VoiceEngineSettingsView {
                 .animation(.spring(response: 0.5, dampingFraction: 0.7), value: model.id)
             }
 
-            if model == .cohereTranscribeSixBit {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .center, spacing: 10) {
-                        Image(systemName: "globe")
-                            .font(.caption)
-                            .foregroundStyle(self.theme.palette.accent)
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Select Language Manually")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                            Text("Choose the language token injected into Cohere's transcription prompt.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-
-                        Spacer(minLength: 8)
-
-                        Picker("Cohere Language", selection: Binding(
-                            get: { self.settings.selectedCohereLanguage },
-                            set: { newValue in
-                                guard newValue != self.settings.selectedCohereLanguage else { return }
-                                self.settings.selectedCohereLanguage = newValue
-                            }
-                        )) {
-                            ForEach(SettingsStore.CohereLanguage.allCases) { language in
-                                Text(language.displayName).tag(language)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
-                        .disabled(self.viewModel.asr.isRunning)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(self.theme.palette.accent.opacity(0.08))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(self.theme.palette.accent.opacity(0.20), lineWidth: 1)
-                        )
-                )
-            }
-
             if supportsCustomWords {
                 HStack(alignment: .center, spacing: 10) {
                     Image(systemName: "checkmark.seal.fill")
@@ -378,7 +331,7 @@ extension VoiceEngineSettingsView {
                 Text(model.humanReadableName)
                     .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
                     .foregroundStyle(isSelected ? self.theme.palette.primaryText : .secondary)
-                Text(model.displayName)
+                Text(self.speechModelSubtitle(for: model))
                     .font(.caption)
                     .foregroundStyle(.secondary.opacity(0.7))
 
@@ -463,6 +416,9 @@ extension VoiceEngineSettingsView {
                 HStack(spacing: 8) {
                     if isConfiguredActive {
                         let isLoading = (self.viewModel.asr.isLoadingModel || self.viewModel.asr.isDownloadingModel) && !self.viewModel.asr.isAsrReady
+                        self.speechModelLanguagePicker(for: model)
+                            .disabled(self.viewModel.asr.isRunning)
+
                         Text(isLoading ? "Loading…" : "Active")
                             .font(.caption2)
                             .fontWeight(.semibold)
@@ -567,6 +523,109 @@ extension VoiceEngineSettingsView {
         }
         .opacity(self.viewModel.asr.isRunning ? 0.6 : 1.0)
         .allowsHitTesting(!self.viewModel.asr.isRunning)
+    }
+
+    @ViewBuilder
+    private func speechModelLanguagePicker(for model: SettingsStore.SpeechModel) -> some View {
+        if model == .cohereTranscribeSixBit {
+            Menu {
+                ForEach(SettingsStore.CohereLanguage.allCases) { language in
+                    Button {
+                        guard language != self.settings.selectedCohereLanguage else { return }
+                        self.settings.selectedCohereLanguage = language
+                    } label: {
+                        HStack {
+                            Text(language.displayName)
+                            if language == self.settings.selectedCohereLanguage {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                self.languageChipLabel(self.settings.selectedCohereLanguage.displayName)
+            }
+            .buttonStyle(.plain)
+        } else if model == .nemotronOffline || model == .nemotronStreaming || model == .nemotronStreaming320 {
+            self.nemotronLanguagePickerButton
+        }
+    }
+
+    private func languageChipLabel(_ title: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "globe")
+                .font(.caption2)
+                .foregroundStyle(self.theme.palette.accent)
+            Text(title)
+                .lineLimit(1)
+                .fontWeight(.semibold)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption2)
+        .frame(minHeight: 24)
+        .padding(.horizontal, 9)
+        .background(
+            Capsule()
+                .fill(self.theme.palette.accent.opacity(0.10))
+                .overlay(
+                    Capsule()
+                        .stroke(self.theme.palette.accent.opacity(0.28), lineWidth: 1)
+                )
+        )
+    }
+
+    private func speechModelSubtitle(for model: SettingsStore.SpeechModel) -> String {
+        switch model {
+        case .nemotronStreaming, .nemotronStreaming320:
+            return "Nemotron Speech 3.5 - Streaming Capable"
+        default:
+            return model.displayName
+        }
+    }
+
+    private var nemotronLanguagePickerButton: some View {
+        Button {
+            self.isShowingNemotronLanguagePicker.toggle()
+        } label: {
+            self.languageChipLabel(self.settings.selectedNemotronLanguage.compactDisplayName)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: self.$isShowingNemotronLanguagePicker, arrowEdge: .bottom) {
+            self.nemotronLanguagePickerPopover
+        }
+    }
+
+    private var nemotronLanguagePickerPopover: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(SettingsStore.NemotronLanguage.allCases) { language in
+                    Button {
+                        self.settings.selectedNemotronLanguage = language
+                        self.isShowingNemotronLanguagePicker = false
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(language.displayName)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                            Spacer(minLength: 12)
+                            if language == self.settings.selectedNemotronLanguage {
+                                Image(systemName: "checkmark")
+                                    .font(.caption)
+                                    .foregroundStyle(self.theme.palette.accent)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.horizontal, 12)
+                        .frame(height: 26)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .frame(width: 260, height: 532)
     }
 
     var modelStatusView: some View {

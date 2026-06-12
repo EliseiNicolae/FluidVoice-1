@@ -261,7 +261,10 @@ struct RewriteModeView: View {
 
     private func toggleRecording() {
         if self.asr.isRunning {
-            Task { await self.asr.stop() }
+            Task {
+                _ = await self.asr.stop()
+                _ = self.asr.consumeLastCompletedAudioSnapshot()
+            }
         } else {
             Task { await self.asr.start() }
         }

@@ -3,6 +3,7 @@ import SwiftUI
 struct VoiceEngineSettingsView: View {
     @ObservedObject var viewModel: VoiceEngineSettingsViewModel
     @ObservedObject var settings: SettingsStore
+    @State var isShowingNemotronLanguagePicker = false
     let theme: AppTheme
 
     var body: some View {

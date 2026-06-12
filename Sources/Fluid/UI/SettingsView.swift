@@ -61,6 +61,8 @@ struct SettingsView: View {
     @State private var showAreYouSureToStopAnalytics: Bool = false
     @State private var rollbackVersion: String = ""
     @State private var isRollingBack: Bool = false
+    @State private var audioHistoryBudgetText: String = Self.audioBudgetText(for: SettingsStore.shared.audioHistoryBudgetGB)
+    @State private var audioHistoryUsageBytes: Int64 = DictationAudioHistoryStore.shared.audioUsageBytes()
 
     let hotkeyManager: GlobalHotkeyManager?
     let menuBarManager: MenuBarManager
@@ -137,6 +139,8 @@ struct SettingsView: View {
                     return "__OFF__"
                 case .default:
                     return "__DEFAULT__"
+                case .privateAI:
+                    return PrivateAIProviderPromptFormat.promptSelectionID
                 case let .profile(id):
                     return id
                 }
@@ -146,8 +150,13 @@ struct SettingsView: View {
                 case "__OFF__":
                     self.settings.setDictationPromptSelection(.off, for: slot)
                 case "__DEFAULT__":
+                    guard !PrivateAIProviderPromptFormat.isAvailable(settings: self.settings) else { return }
                     self.settings.setDictationPromptSelection(.default, for: slot)
+                case PrivateAIProviderPromptFormat.promptSelectionID:
+                    guard PrivateAIProviderPromptFormat.isAvailable(settings: self.settings) else { return }
+                    self.settings.setDictationPromptSelection(.privateAI, for: slot)
                 default:
+                    guard !PrivateAIProviderPromptFormat.isAvailable(settings: self.settings) else { return }
                     self.settings.setDictationPromptSelection(.profile(newValue), for: slot)
                 }
             }
@@ -157,6 +166,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func dictationPromptPicker(for slot: SettingsStore.DictationShortcutSlot) -> some View {
         let profiles = self.settings.promptProfiles(for: .dictate)
+        let privateAILocked = PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
         HStack {
             Text("AI Prompt")
                 .font(.subheadline)
@@ -165,9 +175,16 @@ struct SettingsView: View {
             Spacer()
             Picker("", selection: self.dictationPromptSelectionBinding(for: slot)) {
                 Text("Off").tag("__OFF__")
-                Text("Default").tag("__DEFAULT__")
+                Text("Default").tag("__DEFAULT__").disabled(privateAILocked)
+                if PrivateFeatures.privateAIProvider {
+                    Text(PrivateAIProviderFeature.displayName)
+                        .tag(PrivateAIProviderPromptFormat.promptSelectionID)
+                        .disabled(!privateAILocked)
+                }
                 ForEach(profiles) { profile in
-                    Text(profile.name.isEmpty ? "Untitled" : profile.name).tag(profile.id)
+                    Text(profile.name.isEmpty ? "Untitled" : profile.name)
+                        .tag(profile.id)
+                        .disabled(privateAILocked)
                 }
             }
             .frame(width: 190)
@@ -815,10 +832,36 @@ struct SettingsView: View {
                                         description: "Save transcriptions for stats tracking. Disable for privacy.",
                                         isOn: Binding(
                                             get: { SettingsStore.shared.saveTranscriptionHistory },
-                                            set: { SettingsStore.shared.saveTranscriptionHistory = $0 }
+                                            set: {
+                                                SettingsStore.shared.saveTranscriptionHistory = $0
+                                                self.refreshAudioHistoryUsage()
+                                            }
                                         )
                                     )
                                     Divider().opacity(0.2)
+
+                                    self.optionToggleRow(
+                                        title: "Save Audio With History",
+                                        description: "Store actual microphone audio locally with dictation history. Disabled by default.",
+                                        isOn: Binding(
+                                            get: { SettingsStore.shared.saveAudioWithTranscriptionHistory },
+                                            set: {
+                                                SettingsStore.shared.saveAudioWithTranscriptionHistory = $0
+                                                self.refreshAudioHistoryUsage()
+                                            }
+                                        )
+                                    )
+                                    .disabled(!SettingsStore.shared.saveTranscriptionHistory)
+
+                                    if SettingsStore.shared.saveTranscriptionHistory,
+                                       SettingsStore.shared.saveAudioWithTranscriptionHistory
+                                    {
+                                        self.audioHistoryControls()
+                                            .padding(.top, 2)
+                                        Divider().opacity(0.2)
+                                    } else {
+                                        Divider().opacity(0.2)
+                                    }
 
                                     self.optionToggleRow(
                                         title: "Notify AI Enhancement Failures",
@@ -1567,6 +1610,7 @@ struct SettingsView: View {
                 self.cachedDefaultOutputName = AudioDevice.getDefaultOutputDevice()?.name ?? ""
                 self.refreshRollbackState()
                 self.settings.refreshLaunchAtStartupStatus(clearError: true, logMismatch: false)
+                self.refreshAudioHistoryUsage()
             }
         }
         .onChange(of: self.visualizerNoiseThreshold) { _, newValue in
@@ -1658,6 +1702,85 @@ struct SettingsView: View {
         self.shareAnonymousAnalytics = SettingsStore.shared.shareAnonymousAnalytics
         self.pendingAnalyticsValue = nil
         self.showAreYouSureToStopAnalytics = false
+        self.refreshAudioHistoryUsage()
+    }
+
+    private func refreshAudioHistoryUsage() {
+        self.audioHistoryUsageBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        self.audioHistoryBudgetText = Self.audioBudgetText(for: SettingsStore.shared.audioHistoryBudgetGB)
+    }
+
+    private func applyAudioHistoryBudget() {
+        let normalized = self.audioHistoryBudgetText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(normalized), value > 0 else {
+            self.presentErrorAlert(title: "Invalid Budget", message: "Enter a positive number of GB.")
+            self.refreshAudioHistoryUsage()
+            return
+        }
+
+        let newBudget = max(0.1, value)
+        let newBudgetBytes = DictationAudioHistoryStore.bytes(forGigabytes: newBudget)
+        if self.audioHistoryUsageBytes > newBudgetBytes {
+            let confirm = NSAlert()
+            confirm.messageText = "Prune saved audio?"
+            confirm.informativeText = """
+            This budget is below current audio usage. FluidVoice will delete the oldest saved audio first and keep transcript history.
+            """
+            confirm.alertStyle = .warning
+            confirm.addButton(withTitle: "Apply and Prune")
+            confirm.addButton(withTitle: "Cancel")
+            guard confirm.runModal() == .alertFirstButtonReturn else {
+                self.refreshAudioHistoryUsage()
+                return
+            }
+        }
+
+        SettingsStore.shared.audioHistoryBudgetGB = newBudget
+        let pruned = TranscriptionHistoryStore.shared.pruneAudioToBudget()
+        self.refreshAudioHistoryUsage()
+        if pruned > 0 {
+            self.presentInfoAlert(title: "Audio Pruned", message: "Deleted oldest saved audio from \(pruned) history entries.")
+        }
+    }
+
+    private func deleteSavedAudio() {
+        let confirm = NSAlert()
+        confirm.messageText = "Delete saved audio?"
+        confirm.informativeText = "This removes saved dictation audio only. Transcript history stays intact."
+        confirm.alertStyle = .warning
+        confirm.addButton(withTitle: "Delete Audio")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let removed = TranscriptionHistoryStore.shared.deleteAllSavedAudio()
+        self.refreshAudioHistoryUsage()
+        self.presentInfoAlert(title: "Audio Deleted", message: "Removed audio from \(removed) history entries.")
+    }
+
+    private func exportAudioZip() {
+        do {
+            guard TranscriptionHistoryStore.shared.entries.contains(where: {
+                DictationAudioHistoryStore.shared.audioFileExists(for: $0)
+            }) else {
+                throw DictationAudioHistoryError.noAudioEntries
+            }
+
+            let panel = NSSavePanel()
+            panel.canCreateDirectories = true
+            panel.allowedContentTypes = [.zip]
+            panel.nameFieldStringValue = DictationAudioHistoryStore.shared.suggestedAudioExportFilename()
+
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try DictationAudioHistoryStore.shared.exportAudioArchive(
+                entries: TranscriptionHistoryStore.shared.entries,
+                to: url
+            )
+            self.presentInfoAlert(title: "Audio Export Saved", message: "Saved your dictation audio export to:\n\(url.path)")
+        } catch {
+            self.presentErrorAlert(title: "Audio Export Failed", message: error.localizedDescription)
+        }
     }
 
     private func presentInfoAlert(title: String, message: String) {
@@ -1808,6 +1931,86 @@ struct SettingsView: View {
                 .controlSize(.regular)
             }
         }
+    }
+
+    private func audioHistoryControls() -> some View {
+        VStack(spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Audio Storage")
+                        .font(.body)
+                    Text("Audio history: \(DictationAudioHistoryStore.formattedGigabytes(self.audioHistoryUsageBytes)) / \(Self.audioBudgetText(for: SettingsStore.shared.audioHistoryBudgetGB)) GB Budget")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    ProgressView(value: self.audioHistoryUsageFraction())
+                        .progressViewStyle(.linear)
+                        .frame(maxWidth: 220)
+                }
+
+                Spacer(minLength: 16)
+
+                HStack(spacing: 8) {
+                    Text("Budget")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    TextField("4", text: self.$audioHistoryBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 58)
+
+                    Text("GB")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Apply") {
+                        self.applyAudioHistoryBudget()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            Divider().opacity(0.2)
+
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Export Audio")
+                        .font(.body)
+                    Text("ZIP with manifest.jsonl and WAV audio.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 16)
+
+                Button {
+                    self.exportAudioZip()
+                } label: {
+                    Label("Export ZIP", systemImage: "square.and.arrow.up")
+                }
+                .controlSize(.small)
+
+                Button(role: .destructive) {
+                    self.deleteSavedAudio()
+                } label: {
+                    Label("Delete Audio", systemImage: "trash")
+                }
+                .controlSize(.small)
+                .disabled(self.audioHistoryUsageBytes <= 0)
+            }
+        }
+    }
+
+    private static func audioBudgetText(for value: Double) -> String {
+        value.truncatingRemainder(dividingBy: 1) == 0
+            ? String(format: "%.0f", value)
+            : String(format: "%.1f", value)
+    }
+
+    private func audioHistoryUsageFraction() -> Double {
+        let budget = SettingsStore.shared.audioHistoryBudgetBytes
+        guard budget > 0 else { return 0 }
+        return min(1, Double(self.audioHistoryUsageBytes) / Double(budget))
     }
 
     private func optionToggleRow(

@@ -182,6 +182,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         }
         self.selectedModelByProvider = normalizedSel
         self.settings.selectedModelByProvider = normalizedSel
+        self.normalizePrivateAIModels()
 
         // Determine initial model list AND set baseURL BEFORE calling updateCurrentProvider
         if let saved = savedProviders.first(where: { $0.id == selectedProviderID }) {
@@ -242,6 +243,10 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
     }
 
     func providerDisplayName(for providerID: String) -> String {
+        if PrivateFeatures.privateAIProvider, providerID == PrivateAIProviderFeature.shared.providerID {
+            return ModelRepository.shared.displayName(for: providerID)
+        }
+
         switch providerID {
         case "openai": return "OpenAI"
         case "groq": return "Groq"
@@ -249,6 +254,21 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         default:
             return self.savedProviders.first(where: { $0.id == providerID })?.name ?? providerID.capitalized
         }
+    }
+
+    private func normalizePrivateAIModels() {
+        guard PrivateFeatures.privateAIProvider else { return }
+
+        let key = self.providerKey(for: PrivateAIProviderFeature.shared.providerID)
+        let models = PrivateAIModelRegistry.modelIDs()
+        let current = self.selectedModelByProvider[key] ?? ""
+        let selected = PrivateAIModelRegistry.model(id: current)?.id ?? PrivateAIIntegrationService.configuredModelID
+
+        self.availableModelsByProvider[key] = models
+        self.selectedModelByProvider[key] = selected
+        self.settings.availableModelsByProvider = self.availableModelsByProvider
+        self.settings.selectedModelByProvider = self.selectedModelByProvider
+        UserDefaults.standard.set(selected, forKey: PrivateAIIntegrationService.selectedModelDefaultsKey)
     }
 
     func connectionStatus(for providerID: String) -> AIConnectionStatus {
@@ -321,6 +341,57 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         let key = self.providerKey(for: providerID)
         self.settings.verifiedProviderFingerprints[key] = "apple-intelligence"
         self.updateConnectionStatus(.success, for: providerID)
+    }
+
+    func verifyPrivateAIProvider(model: PrivateAIRegisteredModel) async -> Bool {
+        let providerID = PrivateAIProviderFeature.shared.providerID
+        let key = self.providerKey(for: providerID)
+        guard !self.isTestingConnection else { return false }
+
+        self.isTestingConnection = true
+        self.updateConnectionStatus(.testing, for: providerID)
+        self.connectionErrorMessage = ""
+
+        defer {
+            self.isTestingConnection = false
+        }
+
+        guard PrivateAIIntegrationService.isModelInstalled(model) else {
+            self.updateConnectionStatus(.failed, for: providerID)
+            self.connectionErrorMessage = "\(model.displayName) is not installed."
+            return false
+        }
+
+        do {
+            let status = try await PrivateAIIntegrationService.shared.loadModel(model)
+            switch status.state {
+            case .ready:
+                var fingerprints = self.settings.verifiedProviderFingerprints
+                fingerprints[key] = self.privateAIFingerprint(for: model.id)
+                self.settings.verifiedProviderFingerprints = fingerprints
+                self.selectedModelByProvider[key] = model.id
+                self.settings.selectedModelByProvider = self.selectedModelByProvider
+                self.updateConnectionStatus(.success, for: providerID)
+                self.connectionErrorMessage = ""
+                DebugLogger.shared.info(
+                    "Private AI Provider verification succeeded for \(model.id)",
+                    source: "AISettingsView"
+                )
+                return true
+            default:
+                self.updateConnectionStatus(.failed, for: providerID)
+                self.connectionErrorMessage = status.message ?? "\(model.displayName) did not report ready."
+                return false
+            }
+        } catch {
+            self.updateConnectionStatus(.failed, for: providerID)
+            self.connectionErrorMessage = self.privateAIErrorMessage(for: error)
+            DebugLogger.shared.error(
+                "Private AI Provider verification failed for \(model.id): \(self.connectionErrorMessage)",
+                source: "AISettingsView"
+            )
+            return false
+        }
     }
 
     func resetVerification(for providerID: String) {
@@ -1226,6 +1297,19 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    private func privateAIFingerprint(for modelID: String) -> String {
+        PrivateAIProviderFeature.verificationFingerprint(for: modelID)
+    }
+
+    private func privateAIErrorMessage(for error: Error) -> String {
+        if let localizedError = error as? LocalizedError,
+           let description = localizedError.errorDescription
+        {
+            return description
+        }
+        return String(describing: error)
+    }
+
     private func storeVerificationFingerprint(for providerID: String, baseURL: String, apiKey: String) {
         guard let fingerprint = self.fingerprint(baseURL: baseURL, apiKey: apiKey) else { return }
         let key = self.providerKey(for: providerID)
@@ -1263,6 +1347,15 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
             let key = self.providerKey(for: providerID)
             if providerID == "apple-intelligence" {
                 if self.settings.verifiedProviderFingerprints[key] == "apple-intelligence" {
+                    statuses[providerID] = .success
+                } else if statuses[providerID] == .success {
+                    statuses[providerID] = .unknown
+                }
+                continue
+            }
+            if providerID == PrivateAIProviderFeature.shared.providerID {
+                let selected = self.selectedModelByProvider[key] ?? PrivateAIIntegrationService.configuredModelID
+                if self.settings.verifiedProviderFingerprints[key] == self.privateAIFingerprint(for: selected) {
                     statuses[providerID] = .success
                 } else if statuses[providerID] == .success {
                     statuses[providerID] = .unknown
@@ -1673,7 +1766,26 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
     }
 
     func isPrimaryDictationPromptSelectionOff() -> Bool {
-        self.settings.isDictationPromptOff
+        return self.settings.isDictationPromptOff
+    }
+
+    func isPrivateAIPromptAvailable() -> Bool {
+        PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
+    }
+
+    func isPrivateAIModelSelected() -> Bool {
+        PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
+    }
+
+    func isPrivateAIPromptSelected() -> Bool {
+        self.settings.dictationPromptSelection == .privateAI
+    }
+
+    func selectPrivateAIPromptIfAvailable() {
+        guard self.isPrivateAIPromptAvailable() else { return }
+        self.settings.setDictationPromptSelection(.privateAI)
+        self.selectedDictationPromptID = self.settings.selectedDictationPromptID
+        self.isDictationPromptOff = self.settings.isDictationPromptOff
     }
 
     func selectPrimaryDictationPromptOff() {
@@ -1763,7 +1875,11 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
 
     func setSelectedPromptID(_ id: String?, for mode: SettingsStore.PromptMode) {
         if mode.normalized == .dictate {
-            if let id {
+            if self.isPrivateAIModelSelected() {
+                if id == nil {
+                    self.settings.setDictationPromptSelection(.privateAI)
+                }
+            } else if let id {
                 self.settings.setDictationPromptSelection(.profile(id))
             } else {
                 self.settings.setDictationPromptSelection(.default)
