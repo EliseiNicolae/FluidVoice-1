@@ -112,6 +112,7 @@ final class ASRService: ObservableObject {
     @Published var downloadingModelId: String? = nil // Tracks which model is currently being downloaded
 
     private var isStarting: Bool = false // Guard against re-entrant start() calls
+    private var isStopping: Bool = false // Guard against re-entrant stop() during the tail-capture grace window
     private var downloadProgressTask: Task<Void, Never>?
     private var hasCompletedFirstTranscription: Bool = false // Track if model has warmed up with first transcription
     private var lastBoostHitTerm: String?
@@ -528,6 +529,13 @@ final class ASRService: ObservableObject {
     private let audioRouteRecoveryDelayNanoseconds: UInt64 = 1_000_000_000
     private var isRecoveringAudioRoute = false
     private let fastPreviewStopGraceNanoseconds: UInt64 = 200_000_000
+    /// Extra time the mic tap stays live after the user triggers stop, so the tail
+    /// of their final word isn't clipped by input-pipeline latency. User-configurable
+    /// via Settings → "Extra recording after stop" (seconds); 0 disables.
+    private var stopTailCaptureGraceNanoseconds: UInt64 {
+        let seconds = max(0, SettingsStore.shared.recordingTailDuration)
+        return UInt64(seconds * 1_000_000_000)
+    }
     private let fastPreviewSampleRate = 16_000
     private let fastPreviewMinimumSamples = 32_000
     private let fastPreviewTailAudioToleranceMs = 300
@@ -941,10 +949,11 @@ final class ASRService: ObservableObject {
         let stopStartedAt = Date().timeIntervalSince1970
         self.benchmarkLog("stop_start ageMs=\(self.elapsedMilliseconds(since: self.benchmarkRecordingStartedAt)) bufferedSamples=\(self.audioBuffer.count)")
 
-        guard self.isRunning else {
-            DebugLogger.shared.warning("⚠️ STOP() - not running, returning empty string", source: "ASRService")
+        guard self.isRunning, !self.isStopping else {
+            DebugLogger.shared.warning("⚠️ STOP() - not running or already stopping, returning empty string", source: "ASRService")
             return ""
         }
+        self.isStopping = true
         defer { self.applyPendingParakeetVocabularyReloadIfNeeded() }
 
         self.audioRouteRecoveryTask?.cancel()
@@ -957,6 +966,23 @@ final class ASRService: ObservableObject {
 
         DebugLogger.shared.debug("📍 Preparing final transcription", source: "ASRService")
 
+        // Tail-capture grace: keep the mic tap live for a short window after the stop
+        // trigger so the user's final word isn't clipped by input-pipeline latency.
+        // The tap keeps appending to audioBuffer until setRecordingEnabled(false) below.
+        let tailGraceNanoseconds = self.stopTailCaptureGraceNanoseconds
+        if tailGraceNanoseconds > 0 {
+            DebugLogger.shared.debug("⏳ Tail-capture grace: keeping mic live for \(tailGraceNanoseconds / 1_000_000)ms...", source: "ASRService")
+            try? await Task.sleep(nanoseconds: tailGraceNanoseconds)
+        }
+
+        // A cancel (stopWithoutTranscription) can run during the grace sleep above and tear the
+        // session down (isRunning → false). If so, bail without transcribing so the canceled
+        // dictation isn't inserted — the cancel path already owns the teardown and buffer clear.
+        guard self.isRunning else {
+            self.isStopping = false
+            return ""
+        }
+
         DebugLogger.shared.debug("🚫 Setting audioCapturePipeline recording = false...", source: "ASRService")
         self.audioCapturePipeline.setRecordingEnabled(false)
         DebugLogger.shared.debug("✅ Capture pipeline disabled", source: "ASRService")
@@ -966,6 +992,9 @@ final class ASRService: ObservableObject {
         // CRITICAL: Set isRunning to false before teardown so in-flight chunks stop safely.
         DebugLogger.shared.debug("🚫 Setting isRunning = false...", source: "ASRService")
         self.isRunning = false
+        // Release the stop guard as soon as the session isn't "running": holding it across the
+        // slow final transcription would block stopping a recording started during finalization.
+        self.isStopping = false
         DebugLogger.shared.debug("✅ isRunning disabled", source: "ASRService")
 
         // Stop monitoring device to prevent callbacks after stop
