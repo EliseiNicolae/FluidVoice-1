@@ -176,8 +176,34 @@ final class TranscriptionHistoryStore: ObservableObject {
         return self.entries.first(where: { $0.id == id })
     }
 
+    /// Session-only retention of the most recent completed transcription.
+    ///
+    /// Why this is separate from `entries`: `entries` is persisted to UserDefaults and is gated by
+    /// `SettingsStore.saveTranscriptionHistory`, which users legitimately turn off for privacy.
+    /// But that is a preference about *storage on disk*, not about *recovery* — a user who keeps
+    /// history off still needs a way to get back the dictation that just failed to reach its
+    /// destination. This value lives only in memory, is never encoded, never written to disk, and
+    /// dies with the process, so it honours "don't save my history" while still giving the user a
+    /// safety net for the current session.
+    @Published private(set) var lastTranscript: String?
+
+    /// Records the most recent transcription for recovery purposes.
+    ///
+    /// Called for every completed dictation regardless of the history setting and regardless of
+    /// whether insertion later succeeds. Deliberately unconditional: the failure this exists to
+    /// prevent is a transcription that is produced successfully and then lost entirely because
+    /// every retention path happened to be switched off.
+    func retainLastTranscript(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+        self.lastTranscript = trimmed
+    }
+
+    /// Prefers the persisted history when it exists, and falls back to the in-memory retention
+    /// when history saving is disabled. Either way "Copy Last Transcript" is never empty after a
+    /// transcription has completed in this session.
     var latestClipboardText: String? {
-        self.entries.first?.clipboardText
+        self.entries.first?.clipboardText ?? self.lastTranscript
     }
 
     /// Add a new transcription entry

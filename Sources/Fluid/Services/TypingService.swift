@@ -123,7 +123,34 @@ final class TypingService {
     private static let pasteboardSessionSemaphore = DispatchSemaphore(value: 1)
     private static let pasteboardRestoreQueue = DispatchQueue(label: "TypingService.PasteboardRestore", qos: .utility)
     private static var focusSnapshot: FocusSnapshot?
-    private static let ghosttyBundleIdentifier = "com.mitchellh.ghostty"
+    /// Apps that silently discard synthetic unicode CGEvents but accept a real Cmd+V.
+    ///
+    /// The CGEvent path builds key events with `virtualKey: 0` and attaches the text via
+    /// `keyboardSetUnicodeString`. An app is free to ignore that: it is a keystroke with no
+    /// physical key behind it. Toolkits that dispatch on the keycode rather than the attached
+    /// string drop the whole payload — and because `CGEvent.postToPid` returns `Void`, we post six
+    /// events, get no error back, and only find out later that nothing arrived. Routing these apps
+    /// straight to the Reliable Paste path (a genuine Cmd+V, which they handle normally) avoids
+    /// the drop entirely instead of detecting it after the fact.
+    ///
+    /// Exact bundle identifiers, for apps confirmed to need this.
+    private static let forcedReliablePasteBundleIdentifiers: Set<String> = [
+        "com.mitchellh.ghostty",
+        // Android Studio is IntelliJ underneath, so it inherits the same Swing input handling.
+        "com.google.android.studio",
+    ]
+
+    /// Prefix matches, for families that ship many separate bundle identifiers.
+    ///
+    /// Every JetBrains IDE (WebStorm, PyCharm, IntelliJ, PhpStorm, GoLand, CLion, Rider, DataGrip,
+    /// RubyMine, RustRover...) is a Java/Swing app with its own editor input pipeline, and they all
+    /// ignore keycode-less unicode events. Verified against WebStorm 2026.1.3 on 31 Aug 2026: a
+    /// 156-character dictation logged `insert_return inserted=true` and then
+    /// `insert_verify result=absent` — posted, accepted by the window server, never applied by the
+    /// editor. Matching the prefix covers the whole family without enumerating every product.
+    private static let forcedReliablePasteBundlePrefixes: [String] = [
+        "com.jetbrains.",
+    ]
 
     private var textInsertionMode: SettingsStore.TextInsertionMode {
         SettingsStore.shared.textInsertionMode
@@ -344,29 +371,35 @@ final class TypingService {
         return Self.isCurrentlyFocusedElement(element, expectedPID: pid)
     }
 
-    private func isGhosttyApplication(pid: pid_t) -> Bool {
+    /// True when the app owning `pid` is known to drop synthetic unicode CGEvents, so we should
+    /// skip the direct-typing ladder and go straight to a real paste.
+    private func requiresForcedReliablePaste(pid: pid_t) -> Bool {
         guard pid > 0,
-              let app = NSRunningApplication(processIdentifier: pid)
+              let app = NSRunningApplication(processIdentifier: pid),
+              let bundleID = app.bundleIdentifier
         else {
             return false
         }
 
-        return app.bundleIdentifier == Self.ghosttyBundleIdentifier
+        if Self.forcedReliablePasteBundleIdentifiers.contains(bundleID) { return true }
+        return Self.forcedReliablePasteBundlePrefixes.contains { bundleID.hasPrefix($0) }
     }
 
-    private func ghosttyTargetPID(preferredTargetPID: pid_t?) -> pid_t? {
+    /// Resolves the target PID when that target is one of the apps that needs a real paste.
+    /// Checks the caller's preferred PID first, then the focused element, then the frontmost app.
+    private func forcedReliablePasteTargetPID(preferredTargetPID: pid_t?) -> pid_t? {
         if let preferredTargetPID, preferredTargetPID > 0 {
-            return self.isGhosttyApplication(pid: preferredTargetPID) ? preferredTargetPID : nil
+            return self.requiresForcedReliablePaste(pid: preferredTargetPID) ? preferredTargetPID : nil
         }
 
         if let focusedPID = self.getSystemFocusedElementAndPID()?.pid,
-           self.isGhosttyApplication(pid: focusedPID)
+           self.requiresForcedReliablePaste(pid: focusedPID)
         {
             return focusedPID
         }
 
         if let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier,
-           self.isGhosttyApplication(pid: frontmostPID)
+           self.requiresForcedReliablePaste(pid: frontmostPID)
         {
             return frontmostPID
         }
@@ -436,7 +469,10 @@ final class TypingService {
         }()
         let textReadyAge = textReadyAt.map { Self.elapsedMs(from: $0, to: requestedAt) }
         self.bench(
-            "request chars=\(text.count) mode=\(mode.rawValue) autocompleteSteps=\(plan.steps.count) preferredPID=\(preferredTargetPID.map { String($0) } ?? "nil") textReadyAgeMs=\(textReadyAge.map { String($0) } ?? "nil")"
+            // secureInput= is recorded because secure event input silently swallows every CGEvent
+            // we post, with no error and no callback. It is the most likely systemic cause of
+            // "the insert reported success and nothing appeared", and it was never captured.
+            "request chars=\(text.count) mode=\(mode.rawValue) autocompleteSteps=\(plan.steps.count) preferredPID=\(preferredTargetPID.map { String($0) } ?? "nil") textReadyAgeMs=\(textReadyAge.map { String($0) } ?? "nil") secureInput=\(IsSecureEventInputEnabled())"
         )
         self.log("[TypingService] ENTRY: typeTextInstantly called with text length: \(text.count)")
         self.log("[TypingService] Text preview: \"\(String(text.prefix(100)))\"")
@@ -512,16 +548,40 @@ final class TypingService {
                 self.log("[TypingService] Delay completed, calling insertTextInstantly")
                 let insertStartedAt = ProcessInfo.processInfo.systemUptime
                 self.bench("insert_call")
-                let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
+                let insertionPath = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
+
+                // `path=` and `inserted=` are the two fields this line was missing. It previously
+                // recorded only elapsed time, and elapsed time is identical for a delivered insert
+                // and a silently-dropped one (~0.5 ms either way), so a shipped build gave no way
+                // to tell which branch ran, let alone whether it worked. Everything else in this
+                // file logs through the flag-gated `log()`, which is off in production; `bench()`
+                // always writes, so the diagnostic detail has to live here.
                 self.bench(
-                    "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
+                    "insert_return path=\(insertionPath?.rawValue ?? "none") inserted=\(insertionPath != nil) chars=\(text.count) elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
                 )
-                guard inserted else {
+
+                guard let insertionPath else {
                     outcome = .insertionFailed
+                    // The whole ladder is exhausted and the text is nowhere. Never drop a
+                    // transcription on the floor: hand it back through the clipboard.
+                    self.rescueUndeliveredText(text, reason: "pipeline_exhausted")
                     return
                 }
 
                 outcome = .inserted
+
+                // `.inserted` above is a claim, not a fact, for the fire-and-forget paths. Confirm
+                // it out-of-band and rescue the text if it demonstrably did not land. Deliberately
+                // scheduled AFTER the insert returns, on a separate utility queue: verification
+                // costs Accessibility IPC plus polling, and the hot path must stay at its current
+                // ~0.5 ms for the large majority of inserts that work perfectly.
+                if insertionPath.needsPostDeliveryVerification {
+                    self.scheduleDeliveryVerification(
+                        text: text,
+                        path: insertionPath,
+                        targetPID: preferredTargetPID
+                    )
+                }
                 if tracksDictionaryCorrections, postInsertionKey == nil {
                     Task { @MainActor in
                         AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
@@ -575,33 +635,71 @@ final class TypingService {
 
     // MARK: - Internal insertion pipeline
 
-    private func insertTextInstantly(_ text: String, preferredTargetPID: pid_t?) -> Bool {
+    /// Which branch of the insertion ladder actually claimed success.
+    ///
+    /// Why this exists: the ladder used to return a bare `Bool`, and the two things a caller really
+    /// needs were both unrecoverable from it — *which* method ran, and whether that method's
+    /// "success" is a fact or a guess. Some branches genuinely prove delivery: the Accessibility
+    /// path writes a value and reads back an `AXError`, and the clipboard paths drive a real Cmd+V
+    /// through the target's own event handling. The raw CGEvent branches prove nothing, because
+    /// `CGEvent.postToPid` returns `Void` — "success" there means only "the events were enqueued",
+    /// never "the app applied them".
+    enum InsertionPath: String {
+        case forcedReliablePaste = "forced_reliable_paste"
+        case reliablePaste = "reliable_paste"
+        case bulkCGEventToPID = "bulk_cgevent_pid"
+        case bulkCGEventToFocusedPID = "bulk_cgevent_focused_pid"
+        case accessibility
+        case hidTap = "hid_tap"
+        case clipboard
+        case characterByCharacter = "char_by_char"
+
+        /// True for the fire-and-forget paths, whose "success" is only "events were enqueued".
+        /// These are the ones that can silently swallow an entire dictation, so these are the ones
+        /// we confirm out-of-band. Re-verifying the others would only add cost: the reliable-paste
+        /// path already runs its own verification internally, and the Accessibility path already
+        /// round-trips through the target process.
+        var needsPostDeliveryVerification: Bool {
+            switch self {
+            case .bulkCGEventToPID, .bulkCGEventToFocusedPID, .hidTap, .characterByCharacter:
+                return true
+            case .forcedReliablePaste, .reliablePaste, .accessibility, .clipboard:
+                return false
+            }
+        }
+    }
+
+    private func insertTextInstantly(_ text: String, preferredTargetPID: pid_t?) -> InsertionPath? {
         self.log("[TypingService] insertTextInstantly called with \(text.count) characters")
         self.log("[TypingService] Attempting to type text: \"\(text.prefix(50))\(text.count > 50 ? "..." : "")\"")
 
+        // Some apps never apply keycode-less unicode CGEvents, so the direct-typing ladder would
+        // "succeed" and deliver nothing. Send those straight to a real Cmd+V instead of discovering
+        // the drop afterwards: the rescue path works, but it costs the user a verification wait and
+        // leaves them to paste by hand.
         if self.textInsertionMode == .standard,
-           let ghosttyTargetPID = self.ghosttyTargetPID(preferredTargetPID: preferredTargetPID)
+           let forcedPasteTargetPID = self.forcedReliablePasteTargetPID(preferredTargetPID: preferredTargetPID)
         {
-            self.log("[TypingService] Ghostty target detected in standard mode (PID \(ghosttyTargetPID)); forcing Reliable Paste path")
-            if self.tryReliablePasteInsertion(text, preferredTargetPID: ghosttyTargetPID) {
-                self.log("[TypingService] SUCCESS: Ghostty Reliable Paste path completed")
-                return true
+            self.log("[TypingService] Target requires Reliable Paste in standard mode (PID \(forcedPasteTargetPID)); forcing Reliable Paste path")
+            if self.tryReliablePasteInsertion(text, preferredTargetPID: forcedPasteTargetPID) {
+                self.log("[TypingService] SUCCESS: Forced Reliable Paste path completed")
+                return .forcedReliablePaste
             }
-            self.log("[TypingService] Ghostty Reliable Paste path fell through to direct-typing fallbacks")
+            self.log("[TypingService] Forced Reliable Paste path fell through to direct-typing fallbacks")
         }
 
         if self.textInsertionMode == .reliablePaste {
             self.log("[TypingService] Reliable Paste mode enabled")
             if self.tryReliablePasteInsertion(text, preferredTargetPID: preferredTargetPID) {
                 self.log("[TypingService] SUCCESS: Reliable Paste mode completed")
-                return true
+                return .reliablePaste
             }
             self.log("[TypingService] Reliable Paste mode fell through to direct-typing fallbacks")
         } else if let preferredTargetPID, preferredTargetPID > 0 {
             self.log("[TypingService] Experimental Direct Typing mode: trying preferred PID unicode insertion first")
             if self.insertTextBulkInstant(text, targetPID: preferredTargetPID) {
                 self.log("[TypingService] SUCCESS: Preferred PID CGEvent insertion completed")
-                return true
+                return .bulkCGEventToPID
             }
             self.log("[TypingService] Preferred PID CGEvent insertion failed, continuing fallback pipeline")
         }
@@ -635,7 +733,7 @@ final class TypingService {
             self.log("[TypingService] Trying CGEvent insertion targeting focused PID \(focusedPID)")
             if self.insertTextBulkInstant(text, targetPID: focusedPID) {
                 self.log("[TypingService] SUCCESS: CGEvent focused-PID insertion completed")
-                return true
+                return .bulkCGEventToFocusedPID
             }
         }
 
@@ -643,7 +741,7 @@ final class TypingService {
         self.log("[TypingService] Trying Accessibility focused-element insertion")
         if self.insertTextViaAccessibility(text) {
             self.log("[TypingService] SUCCESS: Accessibility insertion completed")
-            return true
+            return .accessibility
         }
 
         // HID Fallback if PID targeting failed
@@ -651,7 +749,7 @@ final class TypingService {
             self.log("[TypingService] No focused PID available, trying HID CGEvent insertion")
             if self.insertTextBulkHIDInstant(text) {
                 self.log("[TypingService] SUCCESS: CGEvent HID insertion completed")
-                return true
+                return .hidTap
             }
         }
 
@@ -659,7 +757,7 @@ final class TypingService {
         self.log("[TypingService] CGEvent failed, trying clipboard fallback")
         if self.insertTextViaClipboard(text) {
             self.log("[TypingService] SUCCESS: Clipboard insertion completed")
-            return true
+            return .clipboard
         }
 
         // Last resort: Character-by-character
@@ -672,7 +770,7 @@ final class TypingService {
             usleep(1000)
         }
         self.log("[TypingService] Character-by-character typing completed")
-        return true
+        return .characterByCharacter
     }
 
     private func waitForPhysicalModifiersToRelease(timeout: TimeInterval) -> Bool {
@@ -1007,6 +1105,131 @@ final class TypingService {
 
         self.log("[TypingService] Posted \(chunkCount) unicode CGEvent chunk(s) to \(destinationDescription) with chunkSize=\(Self.cgEventUnicodeChunkSize) interChunkDelayMs=0")
         return true
+    }
+
+    // MARK: - Post-delivery verification and clipboard rescue
+
+    private static let deliveryVerificationQueue = DispatchQueue(
+        label: "TypingService.DeliveryVerification",
+        qos: .utility
+    )
+
+    /// Verification budget. Long enough for a busy target (a terminal rendering a long-running
+    /// process, an Electron editor mid-repaint) to settle and expose the new text over
+    /// Accessibility; short enough that the rescue message still reads as belonging to the
+    /// dictation the user just spoke.
+    private static let deliveryVerificationTimeoutMicros: useconds_t = 900_000
+
+    private enum DeliveryVerification: String {
+        /// We read the destination and the dictation is in it.
+        case confirmed
+        /// We read the destination repeatedly for the whole budget and the dictation is not there.
+        case absent
+        /// The destination exposes no readable text over Accessibility, or focus moved away, so
+        /// "absent" would be a guess rather than a reading.
+        case unreadable
+    }
+
+    private func scheduleDeliveryVerification(text: String, path: InsertionPath, targetPID: pid_t?) {
+        Self.deliveryVerificationQueue.async { [weak self] in
+            guard let self else { return }
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let result = self.confirmTextIsPresentInFocusedField(
+                text,
+                expectedPID: targetPID,
+                timeoutMicros: Self.deliveryVerificationTimeoutMicros
+            )
+            self.bench(
+                "insert_verify path=\(path.rawValue) result=\(result.rawValue) chars=\(text.count) elapsedMs=\(Self.elapsedMs(since: startedAt))"
+            )
+
+            switch result {
+            case .confirmed:
+                break // Text is in the target field. Nothing to do, nothing to say.
+
+            case .absent:
+                // Events were posted and the target demonstrably never applied them — exactly the
+                // failure mode that silently ate a 43-second dictation.
+                self.rescueUndeliveredText(text, reason: "verification_absent")
+
+            case .unreadable:
+                // Do NOT clobber the user's clipboard on a guess. Apps that draw their own text
+                // (some terminals, canvas editors, games) legitimately expose nothing here, and
+                // overwriting the pasteboard after every successful dictation into such an app
+                // would be a worse bug than the one being fixed. The unconditional in-memory
+                // retention in TranscriptionHistoryStore.retainLastTranscript is the net for this
+                // case, reachable any time via "Copy Last Transcript".
+                break
+            }
+        }
+    }
+
+    /// Polls the focused element to see whether the inserted text actually arrived.
+    ///
+    /// Deliberately different from the pre-insertion verification helper, which needs a "before"
+    /// snapshot captured on the hot path — that is exactly the cost this design refuses to pay.
+    /// Here we run entirely after the fact and simply ask "is the dictation in the destination
+    /// now?". We match a tail slice rather than the whole string because apps normalise what they
+    /// receive (terminals re-wrap to their own width, editors re-indent, some fields collapse
+    /// whitespace), so a whole-string `contains` would report false negatives on text that really
+    /// did land. The tail is used rather than the head because a scrolled field keeps the end of
+    /// the value visible more reliably than the start.
+    private func confirmTextIsPresentInFocusedField(
+        _ text: String,
+        expectedPID: pid_t?,
+        timeoutMicros: useconds_t
+    ) -> DeliveryVerification {
+        let needle = String(text.suffix(40)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard needle.isEmpty == false else { return .unreadable }
+
+        let pollMicros: useconds_t = 60_000
+        var waited: useconds_t = 0
+        var everReadAValue = false
+
+        while waited < timeoutMicros {
+            usleep(pollMicros)
+            waited += pollMicros
+
+            guard let focusInfo = self.getSystemFocusedElementAndPID() else { continue }
+
+            // If focus has moved to another process the user has moved on, and we can no longer
+            // say anything about the original target. Stop rather than report a false negative.
+            if let expectedPID, focusInfo.pid != expectedPID { return .unreadable }
+
+            guard let value = self.getElementStringValue(focusInfo.element) else { continue }
+            everReadAValue = true
+            if value.contains(needle) { return .confirmed }
+        }
+
+        // Distinguishing these two is the whole point: "I could read the field and the text is not
+        // there" is a real drop worth acting on; "I could never read the field" is not.
+        return everReadAValue ? .absent : .unreadable
+    }
+
+    /// Last-resort retention. The dictation could not be placed in its destination, so make sure
+    /// the user can still get at it instead of losing it entirely.
+    ///
+    /// The pasteboard is overwritten ONLY here, on a confirmed failure — never speculatively — so
+    /// a dictation that works never costs the user their existing clipboard contents.
+    private func rescueUndeliveredText(_ text: String, reason: String) {
+        guard text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return }
+
+        ClipboardService.copyToClipboard(text)
+        // warning(), not the flag-gated log(): a lost dictation must be visible in a shipped build.
+        DebugLogger.shared.warning(
+            "Insertion could not be confirmed (\(reason)); copied \(text.count) characters to the clipboard instead",
+            source: "TypingService"
+        )
+        self.bench("insert_rescue reason=\(reason) chars=\(text.count) action=clipboard")
+
+        Task { @MainActor in
+            // Retain it in memory too, so "Copy Last Transcript" still works even if the user
+            // copies something else before noticing the message.
+            TranscriptionHistoryStore.shared.retainLastTranscript(text)
+            // Telling the user matters as much as the copy itself. A silent clipboard write is
+            // just a second silent failure — they would still be staring at an empty cursor.
+            NotchOverlayManager.shared.updateTranscriptionText("Couldn't insert - copied to clipboard")
+        }
     }
 
     private static func unicodeChunkEnd(in utf16Array: [UInt16], start: Int) -> Int {

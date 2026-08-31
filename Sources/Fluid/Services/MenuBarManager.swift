@@ -596,7 +596,12 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         let hotkeyInfo = hotkeyDisplay.isEmpty ? "" : " (\(hotkeyDisplay))"
         let statusTitle = self.isRecording ? "Recording...\(hotkeyInfo)" : "Ready to Record\(hotkeyInfo)"
         self.statusMenuItem?.title = statusTitle
+        // A permanently-greyed "Copy Last Transcript" reads as a broken feature. Say which of the
+        // two reasons applies, so the user is not left guessing why nothing is available.
         self.copyLastTranscriptMenuItem?.isEnabled = self.canCopyLastTranscript
+        self.copyLastTranscriptMenuItem?.title = self.canCopyLastTranscript
+            ? "Copy Last Transcript"
+            : (self.isProcessingActive ? "Copy Last Transcript (transcribing...)" : "Copy Last Transcript (none yet)")
         self.microphoneMenuItem?.isEnabled = true
 
         // Update rollback availability text

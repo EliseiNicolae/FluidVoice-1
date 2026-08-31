@@ -2410,8 +2410,27 @@ struct ContentView: View {
         let frontmostName = frontmostApp?.localizedName ?? "Unknown"
         let isFluidFrontmost = frontmostApp?.bundleIdentifier == Bundle.main.bundleIdentifier
 
+        // Retain the transcript for recovery the instant it exists, before anything downstream can
+        // go wrong. This is unconditional by design: no setting gates it and no insertion outcome
+        // affects it. The failure it prevents was observed on 31 Aug 2026 — a 43-second dictation
+        // transcribed cleanly (403 chars, 0.95 confidence) and was then lost completely, because
+        // history saving and clipboard copying were both switched off in settings and the insert
+        // silently no-opped, leaving the text alive only inside discarded CGEvents. Memory-only,
+        // so it does not violate the user's choice to keep history off disk.
+        TranscriptionHistoryStore.shared.retainLastTranscript(finalText)
+
+        // Log the gate decision either way. Until now "history is turned off" and "the history
+        // write failed" were indistinguishable in the logs — both produced total silence, because
+        // the only log statement on this path lives inside addEntry. That ambiguity cost a full
+        // investigation, so record the inputs to the decision, not just its side effects.
+        let willSaveHistory = shouldPersistOutputs && !sendsExistingDraft
+            && SettingsStore.shared.saveTranscriptionHistory
+        self.appBench(
+            "history_gate save=\(willSaveHistory) persistOutputs=\(shouldPersistOutputs) existingDraft=\(sendsExistingDraft) settingEnabled=\(SettingsStore.shared.saveTranscriptionHistory) chars=\(finalText.count)"
+        )
+
         // Save to transcription history (transcription mode only, if enabled)
-        if shouldPersistOutputs, !sendsExistingDraft, SettingsStore.shared.saveTranscriptionHistory {
+        if willSaveHistory {
             let historyEntryID = UUID()
             let historyTimestamp = Date()
             TranscriptionHistoryStore.shared.addEntry(
