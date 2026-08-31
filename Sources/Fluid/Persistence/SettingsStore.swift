@@ -2061,6 +2061,25 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// When enabled, the audio capture stack is kept warm (microphone active) indefinitely
+    /// between dictations instead of being retired after the standby timeout. Recording then
+    /// starts instantly every time, at the cost of macOS showing the mic indicator continuously.
+    /// Default off: the engine is retired automatically once it has been idle for a short while.
+    static let defaultKeepMicrophoneAlwaysOn: Bool = false
+
+    var keepMicrophoneAlwaysOn: Bool {
+        get {
+            guard self.defaults.object(forKey: Keys.keepMicrophoneAlwaysOn) != nil else {
+                return Self.defaultKeepMicrophoneAlwaysOn
+            }
+            return self.defaults.bool(forKey: Keys.keepMicrophoneAlwaysOn)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.keepMicrophoneAlwaysOn)
+        }
+    }
+
     // MARK: - Overlay Position
 
     /// Size options for the recording overlay
@@ -3290,6 +3309,7 @@ final class SettingsStore: ObservableObject {
             // Current builds always resolve microphones from the priority list.
             microphoneSelectionMode: .manual,
             visualizerNoiseThreshold: self.visualizerNoiseThreshold,
+            keepMicrophoneAlwaysOn: self.keepMicrophoneAlwaysOn,
             overlayPosition: self.overlayPosition,
             overlayBottomOffset: self.overlayBottomOffset,
             overlaySize: self.overlaySize,
@@ -3443,6 +3463,7 @@ final class SettingsStore: ObservableObject {
             self.microphoneSelectionMode = .manual
         }
         self.visualizerNoiseThreshold = payload.visualizerNoiseThreshold
+        self.keepMicrophoneAlwaysOn = payload.keepMicrophoneAlwaysOn ?? Self.defaultKeepMicrophoneAlwaysOn
         self.overlayPosition = payload.overlayPosition
         self.overlayBottomOffset = payload.overlayBottomOffset
         self.overlaySize = payload.overlaySize
@@ -5337,6 +5358,7 @@ private extension SettingsStore {
         static let microphoneSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
         static let showMicrophoneChangeAlerts = "ShowMicrophoneChangeAlerts"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
+        static let keepMicrophoneAlwaysOn = "KeepMicrophoneAlwaysOn"
         static let launchAtStartup = "LaunchAtStartup"
         static let showInDock = "ShowInDock"
         static let accentColorOption = "AccentColorOption"

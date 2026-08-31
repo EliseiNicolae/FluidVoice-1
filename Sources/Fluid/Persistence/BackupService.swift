@@ -79,6 +79,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let preferredOutputDeviceUID: String?
     let microphoneSelectionMode: SettingsStore.MicrophoneSelectionMode?
     let visualizerNoiseThreshold: Double
+    // Optional so backups written before this field existed still decode.
+    let keepMicrophoneAlwaysOn: Bool?
     let overlayPosition: SettingsStore.OverlayPosition
     let overlayBottomOffset: Double
     let overlaySize: SettingsStore.OverlaySize

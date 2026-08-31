@@ -773,8 +773,34 @@ final class ASRService: ObservableObject {
         }
     }
 
+    /// Applies the "keep microphone always on" preference the moment the user toggles it.
+    /// Turning it ON cancels any pending standby retirement so a currently-warm stack stays warm.
+    /// Turning it OFF re-arms the standby timer if capture is prepared and idle, so the mic
+    /// indicator clears after the normal timeout. Does nothing if the stack is already cold — it
+    /// simply warms on the next recording and then stays warm while the preference is on.
+    func applyKeepMicrophoneAlwaysOnPreference() {
+        if SettingsStore.shared.keepMicrophoneAlwaysOn {
+            self.audioEngineStandbyTask?.cancel()
+            self.audioEngineStandbyTask = nil
+            DebugLogger.shared.info("🎙️ Keep microphone always on enabled — warm capture will not idle-retire", source: "ASRService")
+        } else if self.hasPreparedAudioCapture, self.isRunning == false, self.isStarting == false {
+            DebugLogger.shared.info("🎙️ Keep microphone always on disabled — re-arming standby retirement", source: "ASRService")
+            self.scheduleAudioEngineStandbyRetirement()
+        }
+    }
+
     private func scheduleAudioEngineStandbyRetirement() {
         self.audioEngineStandbyTask?.cancel()
+        self.audioEngineStandbyTask = nil
+
+        // User opted to force the microphone on: keep the warm capture stack alive indefinitely
+        // so the next recording always starts instantly. It is then retired only on quit, on a
+        // route/teardown path, or when the user turns this off (applyKeepMicrophoneAlwaysOnPreference).
+        guard SettingsStore.shared.keepMicrophoneAlwaysOn == false else {
+            DebugLogger.shared.debug("🎙️ Keep microphone always on — skipping standby retirement", source: "ASRService")
+            return
+        }
+
         let delay = self.audioEngineStandbyNanoseconds
         self.audioEngineStandbyTask = Task { [weak self] in
             do {
