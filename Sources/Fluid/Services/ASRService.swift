@@ -2703,7 +2703,7 @@ final class ASRService: ObservableObject {
             )
         }
 
-        let estimatedSamples = try LocalAPIAudioDecoder.validateDurationWithinLimit(for: fileURL)
+        let estimatedSamples = try LocalAPIAudioDecoder.estimatedSampleCount(for: fileURL)
 
         try await self.ensureAsrReady()
         let provider = self.transcriptionProvider
@@ -2715,10 +2715,63 @@ final class ASRService: ObservableObject {
             )
         }
 
-        guard provider.prefersNativeFileTranscription else {
-            let samples = try LocalAPIAudioDecoder.samples(from: fileURL)
+        if provider.prefersNativeFileTranscription,
+           estimatedSamples > 0,
+           estimatedSamples < 16_000
+        {
+            let reader = try LocalAPIAudioDecoder.ChunkReader(fileURL: fileURL)
+            let samples = try await reader.nextSamples()
             let result = try await self.transcribeSamplesForAPI(samples)
-            return (result, samples.count)
+            return (result, sampleCount: estimatedSamples)
+        }
+
+        guard provider.prefersNativeFileTranscription else {
+            let reader = try LocalAPIAudioDecoder.ChunkReader(fileURL: fileURL)
+            let (combinedText, confidence, processedSampleCount) = try await transcriptionExecutor.run { [provider] in
+                var textParts: [String] = []
+                var weightedConfidence = 0.0
+                var processedSampleCount = 0
+
+                while true {
+                    var samples = try await reader.nextSamples()
+                    let sampleCount = samples.count
+                    guard sampleCount > 0 else { break }
+                    if sampleCount < 16_000 {
+                        samples.append(contentsOf: repeatElement(0.0, count: 16_000 - sampleCount))
+                    }
+
+                    let result = try await provider.transcribeFinal(samples)
+                    if !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        textParts.append(result.text)
+                    }
+                    weightedConfidence += Double(result.confidence) * Double(sampleCount)
+                    processedSampleCount += sampleCount
+                }
+
+                let confidence = processedSampleCount > 0
+                    ? Float(weightedConfidence / Double(processedSampleCount))
+                    : 0
+                return (textParts.joined(separator: " "), confidence, processedSampleCount)
+            }
+
+            guard processedSampleCount > 0 else {
+                return (ASRTranscriptionResult(text: "", confidence: 0), sampleCount: 0)
+            }
+
+            if !self.hasCompletedFirstTranscription {
+                self.hasCompletedFirstTranscription = true
+                self.isLoadingModel = false
+                self.modelPreparationPhase = nil
+            }
+
+            let cleanedText = ASRService.applySpokenPunctuationFormatting(
+                ASRService.applyCustomDictionary(ASRService.removeFillerWords(combinedText))
+            )
+            self.recordWordBoostHitIfAny(transcribedText: cleanedText)
+            return (
+                ASRTranscriptionResult(text: cleanedText, confidence: confidence),
+                sampleCount: estimatedSamples
+            )
         }
 
         let result = try await transcriptionExecutor.run { [provider] in
