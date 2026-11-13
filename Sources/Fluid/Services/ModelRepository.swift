@@ -56,6 +56,22 @@ final class ModelRepository {
         }
     }
 
+    /// Returns models eligible for one app mode. Remote providers keep their
+    /// normal model list; Fluid Intelligence supplies task-scoped local models.
+    func defaultModels(for providerID: String, task: PrivateAIModelTask) -> [String] {
+        if PrivateFeatures.privateAIProvider, providerID == PrivateAIProviderFeature.shared.providerID {
+            return PrivateAIProviderFeature.shared.modelIDs(for: task)
+        }
+        return self.defaultModels(for: providerID)
+    }
+
+    static func eligibleModel(preferred: String?, from models: [String]) -> String? {
+        if let preferred, models.contains(preferred) {
+            return preferred
+        }
+        return models.first
+    }
+
     /// Returns the default base URL for a given provider ID.
     func defaultBaseURL(for providerID: String) -> String {
         switch providerID {
@@ -221,8 +237,14 @@ final class ModelRepository {
     ///   - providerID: The provider identifier
     ///   - baseURL: The base URL for the API (e.g., "https://api.openai.com/v1")
     ///   - apiKey: Optional API key for authentication
+    ///   - temperatureSupport: Receives per-model `temperature` support when the listing includes it
     /// - Returns: Array of model IDs sorted alphabetically
-    func fetchModels(for providerID: String, baseURL: String, apiKey: String?) async throws -> [String] {
+    func fetchModels(
+        for providerID: String,
+        baseURL: String,
+        apiKey: String?,
+        temperatureSupport: ModelTemperatureSupport = .shared
+    ) async throws -> [String] {
         if PrivateFeatures.privateAIProvider, providerID == PrivateAIProviderFeature.shared.providerID {
             return PrivateAIProviderFeature.shared.modelIDs()
         }
@@ -296,6 +318,7 @@ final class ModelRepository {
         // Try OpenAI/Groq/Cerebras format first
         if let dataArray = json["data"] as? [[String: Any]] {
             let models = dataArray.compactMap { $0["id"] as? String }
+            temperatureSupport.record(ModelTemperatureSupport.entries(fromModelsResponse: json), baseURL: baseURL)
             DebugLogger.shared.debug(
                 "fetchModels: Found \(models.count) models for '\(providerID)' (OpenAI format)",
                 source: "ModelRepository"

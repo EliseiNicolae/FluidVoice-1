@@ -2,40 +2,73 @@
 import XCTest
 
 // Regression tests for the Anthropic `temperature` deprecation handling.
-// Newer Anthropic models (Opus 4.7+, Sonnet 5, Fable/Mythos 5) reject the `temperature`
-// parameter with HTTP 400 "`temperature` is deprecated for this model."
+// Newer Anthropic models (Opus 4.7+, every Claude 5 model, Fable/Mythos) reject the
+// `temperature` parameter with HTTP 400 "`temperature` is deprecated for this model."
 // See https://github.com/altic-dev/FluidVoice/issues/285 (Opus 4.7) — the same failure
-// recurred for Sonnet 5 because the check only matched claude-opus-4-7.
+// recurred for Sonnet 5 and then Haiku 5.5 (issue #1100) because the check listed
+// individual model IDs, so it is now version-based.
 // Sonnet 4.6 and older still accept `temperature` (verified against the live API)
 // and must keep receiving the app's tuned values.
 
 @MainActor
 final class TemperatureSupportTests: XCTestCase {
+    // These tests cover the name-list fallback, so they read an empty learned store.
+    // `ModelTemperatureSupport.shared` holds the test host's saved values, which win over the name list.
+    private var suiteName: String!
+    private var emptySupport: ModelTemperatureSupport!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        self.suiteName = "TemperatureSupportTests.\(UUID().uuidString)"
+        self.emptySupport = try ModelTemperatureSupport(defaults: XCTUnwrap(UserDefaults(suiteName: self.suiteName)))
+    }
+
+    override func tearDown() {
+        UserDefaults().removePersistentDomain(forName: self.suiteName)
+        super.tearDown()
+    }
+
     func testTemperatureUnsupported_newerAnthropicModels() {
         let unsupported = [
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-haiku-5-5",
             "claude-fable-5",
             "claude-mythos-5",
             // Provider-prefixed and dotted IDs (e.g. OpenRouter) must match too
             "anthropic/claude-sonnet-5",
+            "anthropic/claude-haiku-5.5",
+            "anthropic/claude-opus-5.5",
             "anthropic/claude-opus-4.7",
             "anthropic/claude-opus-4.8",
             "anthropic/claude-opus-4.8-fast",
+            // Issue #1100: Claude 5 models that were never listed individually
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "anthropic/claude-haiku-5.5",
+            "us.anthropic.claude-haiku-5-5-v1:0",
+            // Future versions must not need another code change
+            "claude-opus-4-10",
+            "claude-haiku-6",
         ]
         for model in unsupported {
             XCTAssertTrue(
-                SettingsStore.shared.isTemperatureUnsupported(model),
+                SettingsStore.shared.isTemperatureUnsupported(model, baseURL: "https://api.example.test/v1", support: self.emptySupport),
                 "\(model) rejects `temperature` — sending it fails with HTTP 400"
             )
         }
     }
 
     func testTemperatureUnsupported_openAIReasoningModels() {
-        for model in ["o1", "o3-mini", "gpt-5", "openai/gpt-oss-120b"] {
+        for model in ["o1", "o3-mini", "gpt-5", "gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "openai/gpt-6-luna", "openai/gpt-oss-120b"] {
             XCTAssertTrue(
-                SettingsStore.shared.isTemperatureUnsupported(model),
+                SettingsStore.shared.isTemperatureUnsupported(model, baseURL: "https://api.example.test/v1", support: self.emptySupport),
                 "\(model) is a reasoning model and must not receive `temperature`"
             )
         }
@@ -84,6 +117,14 @@ final class TemperatureSupportTests: XCTestCase {
             "gpt-4.1",
             "claude-sonnet-4-6",
             "claude-sonnet-4-20250514",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-6",
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-3-5-haiku-20241022",
+            "claude-3-7-sonnet-20250219",
+            "claude-opus-4-5-20251101",
             "gemini-2.5-flash",
             "llama3",
             // OpenRouter-prefixed non-reasoning OpenAI models keep temperature
@@ -93,10 +134,11 @@ final class TemperatureSupportTests: XCTestCase {
             "anthropic/claude-sonnet-4.6",
             "anthropic/claude-sonnet-4.5",
             "anthropic/claude-opus-4.5",
+            "anthropic/claude-haiku-4.5",
         ]
         for model in supported {
             XCTAssertFalse(
-                SettingsStore.shared.isTemperatureUnsupported(model),
+                SettingsStore.shared.isTemperatureUnsupported(model, baseURL: "https://api.example.test/v1", support: self.emptySupport),
                 "\(model) still supports `temperature` and should keep receiving it"
             )
         }

@@ -7,7 +7,7 @@ import SwiftUI
 final class DictionaryCorrectionOverlayController {
     static let shared = DictionaryCorrectionOverlayController()
 
-    private static let displayDurationNanoseconds: UInt64 = 5_000_000_000
+    private static let displayDurationNanoseconds: UInt64 = 10_000_000_000
     private static let successDurationNanoseconds: UInt64 = 1_400_000_000
     private static let presentationDuration: TimeInterval = 0.05
     private static let dismissalDuration: TimeInterval = 0.05
@@ -36,7 +36,6 @@ final class DictionaryCorrectionOverlayController {
         onOutcome: @escaping (AutomaticDictionarySuggestionOutcome) -> Void
     ) {
         self.generation &+= 1
-        let currentGeneration = self.generation
         self.dismissTask?.cancel()
         self.session?.cancel()
         self.outcomeHandler = onOutcome
@@ -59,6 +58,18 @@ final class DictionaryCorrectionOverlayController {
             displayDuration: Double(Self.displayDurationNanoseconds) / 1_000_000_000,
             onDismiss: { [weak self] in
                 self?.dismiss()
+            },
+            onIgnore: { [weak self] in
+                self?.reportOutcome(.ignored)
+                self?.hide()
+            },
+            onFrequencyChange: { [weak self] frequency in
+                SettingsStore.shared.automaticDictionarySuggestionFrequency = frequency
+                self?.scheduleChoiceDismissal()
+            },
+            onDisableSuggestions: { [weak self] in
+                SettingsStore.shared.automaticDictionaryLearningEnabled = false
+                self?.hide()
             }
         )
 
@@ -86,6 +97,12 @@ final class DictionaryCorrectionOverlayController {
             panel.animator().alphaValue = 1
         }
 
+        self.scheduleChoiceDismissal()
+    }
+
+    private func scheduleChoiceDismissal() {
+        self.keepVisible()
+        let currentGeneration = self.generation
         self.dismissTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.displayDurationNanoseconds)
             guard !Task.isCancelled,
@@ -138,8 +155,9 @@ final class DictionaryCorrectionOverlayController {
     private func scheduleSuccessDismissal() {
         self.keepVisible()
         let successGeneration = self.generation
+        let duration = self.session?.archiveWarning == nil ? Self.successDurationNanoseconds : Self.displayDurationNanoseconds
         self.dismissTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.successDurationNanoseconds)
+            try? await Task.sleep(nanoseconds: duration)
             guard !Task.isCancelled,
                   let self,
                   self.generation == successGeneration
@@ -243,6 +261,10 @@ final class MicrophoneChangeOverlayController {
     static let shared = MicrophoneChangeOverlayController()
 
     private static let displayDurationNanoseconds: UInt64 = 5_000_000_000
+    private static let supportedBundleIdentifiers = [
+        "com.FluidApp.app",
+        "com.FluidApp.app.debug",
+    ]
     private var panel: NSPanel?
     private var hostingView: NSHostingView<MicrophoneChangeOverlayView>?
     private var dismissTask: Task<Void, Never>?
@@ -251,7 +273,7 @@ final class MicrophoneChangeOverlayController {
     private init() {}
 
     func show(_ notice: MicrophoneChangeNotice) {
-        guard Bundle.main.bundleIdentifier == "com.FluidApp.app",
+        guard Self.supportsAlerts(bundleIdentifier: Bundle.main.bundleIdentifier),
               SettingsStore.shared.showMicrophoneChangeAlerts
         else { return }
         self.generation &+= 1
@@ -300,6 +322,11 @@ final class MicrophoneChangeOverlayController {
         }
     }
 
+    nonisolated static func supportsAlerts(bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return self.supportedBundleIdentifiers.contains(bundleIdentifier)
+    }
+
     func disableFutureAlerts() {
         SettingsStore.shared.showMicrophoneChangeAlerts = false
         self.hide()
@@ -310,17 +337,37 @@ final class MicrophoneChangeOverlayController {
         let hideGeneration = self.generation
         self.dismissTask?.cancel()
         self.dismissTask = nil
-        guard let panel, panel.isVisible else { return }
+        guard let panel else { return }
+        guard panel.isVisible else {
+            self.releasePanel()
+            return
+        }
         self.animate(duration: 0.1) {
             panel.animator().alphaValue = 0
         } completion: { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.generation == hideGeneration else { return }
-                self.panel?.orderOut(nil)
-                self.panel?.alphaValue = 1
-                DictionaryCorrectionOverlayController.shared.transientOverlayLayoutDidChange()
+                self?.finishHide(generation: hideGeneration)
             }
         }
+        // AppKit can reach alpha=0 without delivering the animation completion
+        // (notably for an inactive nonactivating panel). Bound the hosted timeline.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            self?.finishHide(generation: hideGeneration)
+        }
+    }
+
+    private func finishHide(generation: UInt64) {
+        guard self.generation == generation, self.panel != nil else { return }
+        self.releasePanel()
+        DictionaryCorrectionOverlayController.shared.transientOverlayLayoutDidChange()
+    }
+
+    private func releasePanel() {
+        self.panel?.orderOut(nil)
+        self.panel?.contentView = nil
+        self.hostingView = nil
+        self.panel = nil
     }
 
     func topEdge(on screen: NSScreen) -> CGFloat? {
@@ -408,19 +455,19 @@ private struct MicrophoneChangeOverlayView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
                 Image(systemName: self.notice.currentName == nil ? "mic.slash.fill" : "mic.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.fluidSystem(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.78))
                     .frame(width: 24, height: 24)
 
                 Text(self.title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.fluidSystem(size: 12, weight: .medium))
                     .foregroundStyle(.white.opacity(0.72))
 
                 Spacer(minLength: 8)
 
                 Button(action: self.onDismiss) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.fluidSystem(size: 10, weight: .semibold))
                         .foregroundStyle(.white.opacity(self.isCloseHovered ? 0.95 : 0.68))
                         .frame(width: 24, height: 24)
                         .background(Circle().fill(Color.white.opacity(self.isCloseHovered ? 0.13 : 0.06)))
@@ -433,7 +480,7 @@ private struct MicrophoneChangeOverlayView: View {
             }
 
             Text(self.detailText)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.fluidSystem(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
@@ -441,7 +488,7 @@ private struct MicrophoneChangeOverlayView: View {
 
             HStack(spacing: 8) {
                 Text(self.explanation)
-                    .font(.system(size: 11))
+                    .font(.fluidSystem(size: 11))
                     .foregroundStyle(.white.opacity(0.58))
                     .lineLimit(1)
 
@@ -512,12 +559,12 @@ private struct MicrophoneChangeOverlayView: View {
     }
 }
 
-private struct TransientOverlaySettingsButtonStyle: ButtonStyle {
+struct TransientOverlaySettingsButtonStyle: ButtonStyle {
     let isHovered: Bool
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 11, weight: .semibold))
+            .font(.fluidSystem(size: 11, weight: .semibold))
             .foregroundStyle(.white.opacity(configuration.isPressed ? 1 : 0.9))
             .padding(.horizontal, 10)
             .frame(height: 28)
@@ -537,13 +584,17 @@ private struct TransientOverlaySettingsButtonStyle: ButtonStyle {
     }
 }
 
-private struct TransientOverlayCountdownBar: View {
+struct TransientOverlayCountdownBar: View {
     let startedAt: Date
     let duration: TimeInterval
     let reduceMotion: Bool
 
+    /// An animation timeline ticks for as long as the view exists, even in an
+    /// ordered-out panel, so stop it once the countdown has run out.
+    @State private var isElapsed = false
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: self.reduceMotion ? 1 : 1 / 30)) { context in
+        TimelineView(.animation(minimumInterval: self.reduceMotion ? 1 : 1 / 30, paused: self.isElapsed)) { context in
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule()
@@ -558,6 +609,13 @@ private struct TransientOverlayCountdownBar: View {
         .padding(.horizontal, 14)
         .padding(.bottom, 3)
         .allowsHitTesting(false)
+        .task(id: self.startedAt) {
+            self.isElapsed = false
+            let remaining = self.startedAt.timeIntervalSinceNow + self.duration
+            try? await Task.sleep(for: .seconds(max(0, remaining)))
+            guard !Task.isCancelled else { return }
+            self.isElapsed = true
+        }
     }
 
     private func remainingProgress(at date: Date) -> CGFloat {
@@ -566,7 +624,7 @@ private struct TransientOverlayCountdownBar: View {
     }
 }
 
-private struct TransientOverlayBackground: View {
+struct TransientOverlayBackground: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 18, style: .continuous)
             .fill(Color.black)
@@ -589,11 +647,15 @@ extension Notification.Name {
 }
 
 private struct AutomaticDictionaryCorrectionOverlayView: View {
+    @AppStorage("DictionarySharedFeatureMatcherEnabled") private var pronunciationEnabled = DictionaryMatcherExperiment.defaultEnabled
     @ObservedObject var session: AutomaticDictionaryTrainingSession
     @ObservedObject private var settings = SettingsStore.shared
 
     let displayDuration: TimeInterval
     let onDismiss: () -> Void
+    let onIgnore: () -> Void
+    let onFrequencyChange: (SettingsStore.AutomaticDictionarySuggestionFrequency) -> Void
+    let onDisableSuggestions: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isDismissHovered = false
@@ -634,38 +696,107 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
         .onAppear {
             self.startProgressAnimation()
         }
+        .onChange(of: self.pronunciationEnabled) { _, enabled in
+            if !enabled { self.session.disablePronunciationTraining() }
+        }
+    }
+
+    private var correctionChoiceDescription: String {
+        if self.session.candidate.trainingExample != nil, self.session.candidate.negativeCorrection == nil {
+            return "Saves this correction and its dictation audio on this Mac."
+        }
+        if self.session.candidate.negativeCorrection != nil {
+            return "Confirm only if you said a different word, not a spelling change."
+        }
+        return self.pronunciationEnabled
+            ? "Save only this correction, or teach FluidVoice other pronunciations."
+            : "Save this text correction to your dictionary."
     }
 
     private var choiceContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            self.header(title: "Correction noticed", allowsBack: false)
+            self.header(title: self.session.candidate.negativeCorrection == nil ? "Learn this word?" : "Was this a wrong match?", allowsBack: false)
 
             self.correctionPair
 
-            Text("Save only this correction, or teach FluidVoice other pronunciations.")
-                .font(.system(size: 11))
+            Text(self.correctionChoiceDescription)
+                .font(.fluidSystem(size: 11))
                 .foregroundStyle(.white.opacity(0.58))
                 .lineLimit(1)
 
             HStack(spacing: 8) {
-                CorrectionOverlayActionButton(
-                    title: "Train by Voice",
-                    systemImage: "mic.fill",
-                    style: .secondary,
-                    accent: self.accent,
-                    action: self.session.beginTraining
-                )
+                if self.session.candidate.negativeCorrection != nil {
+                    CorrectionOverlayActionButton(title: "That Was a Wrong Match", systemImage: "xmark.circle", style: .accent, accent: self.accent, action: self.session.confirmWrongMatch)
+                        .disabled(!self.pronunciationEnabled || self.session.capturePhase != .idle)
+                    CorrectionOverlayActionButton(title: "Ignore", systemImage: "minus", style: .secondary, accent: self.accent, action: self.onIgnore)
+                } else {
+                    if self.pronunciationEnabled {
+                        CorrectionOverlayActionButton(
+                            title: "Train by Voice",
+                            systemImage: "mic.fill",
+                            style: .secondary,
+                            accent: self.accent,
+                            action: self.session.beginTraining
+                        )
+                    }
 
-                CorrectionOverlayActionButton(
-                    title: "Add This Correction",
-                    systemImage: "plus",
-                    style: .accent,
-                    accent: self.accent,
-                    action: self.session.addOnlyCorrection
-                )
+                    CorrectionOverlayActionButton(
+                        title: "Add This Correction",
+                        systemImage: "plus",
+                        style: .accent,
+                        accent: self.accent,
+                        action: self.session.addOnlyCorrection
+                    )
+
+                    self.moreOptionsMenu
+                }
+            }
+            .disabled(self.session.capturePhase != .idle)
+            if self.session.capturePhase == .processing {
+                Text(self.session.statusMessage)
+                    .font(.fluidSystem(size: 11))
+                    .foregroundStyle(.white.opacity(0.58))
+            }
+            if self.session.hasError {
+                Text(self.session.statusMessage).font(.fluidSystem(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
         }
         .transition(.opacity)
+    }
+
+    private var moreOptionsMenu: some View {
+        Menu {
+            Button("Ignore This Correction", systemImage: "eye.slash", action: self.onIgnore)
+
+            Menu("Ask after") {
+                ForEach(SettingsStore.AutomaticDictionarySuggestionFrequency.allCases) { frequency in
+                    Button {
+                        self.onFrequencyChange(frequency)
+                        self.startProgressAnimation()
+                    } label: {
+                        if self.settings.automaticDictionarySuggestionFrequency == frequency {
+                            Label(frequency.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(frequency.displayName)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button("Stop asking", role: .destructive, action: self.onDisableSuggestions)
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.fluidSystem(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.72))
+                .frame(width: 36, height: 36)
+                .background(self.panelSurface)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("More correction options")
     }
 
     private var trainingContent: some View {
@@ -676,12 +807,12 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
 
             VStack(alignment: .leading, spacing: 9) {
                 Text("Teach FluidVoice your pronunciation")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.fluidSystem(size: 13, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.94))
 
                 if self.session.isReady {
                     Label("FluidVoice got it right 3 times in a row.", systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(.fluidSystem(size: 10.5, weight: .medium))
                         .foregroundStyle(self.accent)
                 } else {
                     VStack(alignment: .leading, spacing: 5) {
@@ -703,7 +834,7 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
                     )
 
                     Text(self.overlayReadinessCaption)
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(.fluidSystem(size: 10.5, weight: .medium))
                         .foregroundStyle(self.session.isReady ? self.accent : .white.opacity(0.58))
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -732,7 +863,7 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
                     self.session.statusMessage,
                     systemImage: "exclamationmark.triangle.fill"
                 )
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.fluidSystem(size: 10.5, weight: .medium))
                 .foregroundStyle(Color.red.opacity(0.9))
                 .lineLimit(1)
             }
@@ -764,12 +895,12 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
     private func trainingInstruction(number: Int, text: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 7) {
             Text("\(number)")
-                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                .font(.fluidSystem(size: 10.5, weight: .semibold, design: .rounded))
                 .foregroundStyle(self.accent)
                 .frame(width: 14)
 
             Text(text)
-                .font(.system(size: 10.5))
+                .font(.fluidSystem(size: 10.5))
                 .foregroundStyle(.white.opacity(0.58))
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -782,18 +913,24 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
                     .fill(self.accent.opacity(0.18))
                     .frame(width: 38, height: 38)
                 Image(systemName: "checkmark")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.fluidSystem(size: 15, weight: .bold))
                     .foregroundStyle(self.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(self.session.successTitle)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.fluidSystem(size: 14, weight: .semibold))
                     .foregroundStyle(.white)
                 Text("“\(self.session.candidate.heardText)” will become “\(self.session.candidate.correctedText)”.")
-                    .font(.system(size: 11))
+                    .font(.fluidSystem(size: 11))
                     .foregroundStyle(.white.opacity(0.6))
                     .lineLimit(1)
+                if let warning = self.session.archiveWarning {
+                    Text(warning)
+                        .font(.fluidSystem(size: 11))
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Spacer(minLength: 8)
@@ -807,7 +944,7 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
             if allowsBack {
                 Button(action: self.session.returnToChoice) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.fluidSystem(size: 10, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.72))
                         .frame(width: 24, height: 24)
                         .background(Circle().fill(Color.white.opacity(0.06)))
@@ -818,20 +955,20 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
                 .help("Back")
             } else {
                 Image(systemName: "mic.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.fluidSystem(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.78))
                     .frame(width: 24, height: 24)
             }
 
             Text(title)
-                .font(.system(size: 12, weight: .medium))
+                .font(.fluidSystem(size: 12, weight: .medium))
                 .foregroundStyle(.white.opacity(0.72))
 
             Spacer(minLength: 8)
 
             Button(action: self.onDismiss) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.fluidSystem(size: 10, weight: .semibold))
                     .foregroundStyle(.white.opacity(self.isDismissHovered ? 0.95 : 0.68))
                     .frame(width: 24, height: 24)
                     .background(
@@ -852,13 +989,13 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
                 .foregroundStyle(.white.opacity(0.78))
 
             Image(systemName: "arrow.right")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.fluidSystem(size: 11, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.42))
 
             Text(self.session.candidate.correctedText)
                 .foregroundStyle(.white)
         }
-        .font(.system(size: 16, weight: .semibold))
+        .font(.fluidSystem(size: 16, weight: .semibold))
         .lineLimit(1)
         .minimumScaleFactor(0.72)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -868,10 +1005,10 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Final output")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.fluidSystem(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.46))
                 Text(self.session.finalOutputText)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.fluidSystem(size: 12, weight: .semibold))
                     .foregroundStyle(.white.opacity(self.session.lastOutput.isEmpty ? 0.48 : 0.9))
                     .lineLimit(1)
             }
@@ -880,7 +1017,7 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
 
             if self.session.isReady {
                 Label("Ready", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.fluidSystem(size: 10.5, weight: .semibold))
                     .foregroundStyle(self.accent)
             }
         }
@@ -892,7 +1029,7 @@ private struct AutomaticDictionaryCorrectionOverlayView: View {
     private var capturedVariantsRow: some View {
         HStack(spacing: 6) {
             Text("Captured")
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.fluidSystem(size: 10.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.46))
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -955,12 +1092,12 @@ private struct CorrectionOverlayReadinessRing: View {
 
             VStack(spacing: 0) {
                 Text("\(self.progress)/\(self.total)")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .font(.fluidSystem(size: 16, weight: .bold, design: .rounded))
                     .foregroundStyle(self.isReady ? self.accent : .white.opacity(0.92))
                     .monospacedDigit()
 
                 Text(self.isReady ? "Ready" : "correct")
-                    .font(.system(size: 8.5, weight: .medium))
+                    .font(.fluidSystem(size: 8.5, weight: .medium))
                     .foregroundStyle(.white.opacity(0.46))
             }
         }
@@ -998,7 +1135,7 @@ private struct CorrectionOverlayActionButton: View {
     var body: some View {
         Button(action: self.action) {
             Label(self.title, systemImage: self.systemImage)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.fluidSystem(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(self.isEnabled ? 0.94 : 0.42))
                 .frame(maxWidth: .infinity)
                 .frame(height: 36)
@@ -1081,7 +1218,7 @@ private struct CorrectionOverlayRecordButton: View {
     var body: some View {
         Button(action: self.action) {
             Label(self.title, systemImage: self.isStop ? "stop.fill" : "mic.fill")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.fluidSystem(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(self.isEnabled ? 0.95 : 0.4))
                 .padding(.horizontal, 13)
                 .frame(height: 36)
@@ -1113,10 +1250,10 @@ private struct CorrectionOverlayVariantChip: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 9))
+                    .font(.fluidSystem(size: 9))
                     .foregroundStyle(.white.opacity(self.isHovered ? 0.72 : 0.42))
             }
-            .font(.system(size: 10.5, weight: .medium))
+            .font(.fluidSystem(size: 10.5, weight: .medium))
             .foregroundStyle(.white.opacity(0.72))
             .padding(.horizontal, 7)
             .frame(height: 23)

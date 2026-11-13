@@ -7,7 +7,7 @@ final class AudioEngineRetirementDrainTests: XCTestCase {
         let drain = AudioEngineRetirementDrain(label: "test.audio-engine-retirement.single")
         let recorder = DeinitRecorder()
         var probe: DeinitProbe? = DeinitProbe(id: 1, recorder: recorder)
-        let token = AudioEngineRetirementToken(try XCTUnwrap(probe))
+        let token = try AudioEngineRetirementToken(XCTUnwrap(probe))
         probe = nil
 
         await drain.releaseAndWait(token)
@@ -23,8 +23,8 @@ final class AudioEngineRetirementDrainTests: XCTestCase {
         let recorder = DeinitRecorder()
         var first: DeinitProbe? = DeinitProbe(id: 1, recorder: recorder)
         var second: DeinitProbe? = DeinitProbe(id: 2, recorder: recorder)
-        let firstToken = AudioEngineRetirementToken(try XCTUnwrap(first))
-        let secondToken = AudioEngineRetirementToken(try XCTUnwrap(second))
+        let firstToken = try AudioEngineRetirementToken(XCTUnwrap(first))
+        let secondToken = try AudioEngineRetirementToken(XCTUnwrap(second))
         first = nil
         second = nil
 
@@ -44,7 +44,7 @@ final class AudioEngineRetirementDrainTests: XCTestCase {
         let drain = AudioEngineRetirementDrain(label: "test.audio-engine-retirement.barrier")
         let recorder = DeinitRecorder()
         var probe: DeinitProbe? = DeinitProbe(id: 1, recorder: recorder)
-        let token = AudioEngineRetirementToken(try XCTUnwrap(probe))
+        let token = try AudioEngineRetirementToken(XCTUnwrap(probe))
         probe = nil
 
         drain.schedule(token)

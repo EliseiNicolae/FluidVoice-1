@@ -18,6 +18,8 @@ jobs:
         with:
           days-before-stale: 5
           days-before-close: 2
+          days-before-issue-stale: 7
+          days-before-issue-close: 3
           start-date: "2026-07-08T00:00:00Z"
 
           stale-issue-label: stale
@@ -25,7 +27,7 @@ jobs:
 
           stale-issue-message: >
             This issue has been marked stale because it has had no activity for
-            5 days. It will be closed in 2 days if there is no further activity.
+            7 days. It will be closed in 3 days if there is no further activity.
             Add the `keep-open` or `pinned` label to prevent automatic closure.
           stale-pr-message: >
             This pull request has been marked stale because it has had no activity
@@ -33,7 +35,7 @@ jobs:
             Add the `keep-open` or `pinned` label to prevent automatic closure.
 
           close-issue-message: >
-            Closing this issue because it remained inactive for 2 days after
+            Closing this issue because it remained inactive for 3 days after
             being marked stale.
           close-pr-message: >
             Closing this pull request because it remained inactive for 2 days

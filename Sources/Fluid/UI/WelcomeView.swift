@@ -1,621 +1,53 @@
-//
-//  WelcomeView.swift
-//  fluid
-//
-//  Welcome and setup guide view
-//
-
 import AppKit
 import AVFoundation
+import Combine
 import SwiftUI
+
+/// Presentation only: preserve the user's selected model and the language catalog's order.
+enum OnboardingModelRecommendation {
+    static func defaultRoutes(forLanguageID languageID: String, from availableRoutes: [VoiceEngineLanguageRoute]) -> [VoiceEngineLanguageRoute] {
+        guard let first = availableRoutes.first else { return [] }
+        guard languageID == "en" else { return [first] }
+        if let english = availableRoutes.first(where: { $0.model == .parakeetTDTv2 }),
+           let mini = availableRoutes.first(where: { $0.model == .fluidParakeetMini })
+        {
+            return [english, mini]
+        }
+        // Mini has the same architecture gate and a newer OS gate. Keep the
+        // established cards when either preferred model is unavailable.
+        var routes = [first]
+        if let builtIn = availableRoutes.first(where: { $0.model == .appleSpeech || $0.model == .appleSpeechAnalyzer }),
+           builtIn.id != first.id
+        {
+            routes.append(builtIn)
+        }
+        return routes
+    }
+}
 
 struct WelcomeView: View {
     @EnvironmentObject var appServices: AppServices
-    private var asr: ASRService {
-        self.appServices.asr
-    }
-
-    @ObservedObject private var settings = SettingsStore.shared
     @Binding var selectedSidebarItem: SidebarItem?
-    @Binding var playgroundUsed: Bool
-    var isTranscriptionFocused: FocusState<Bool>.Binding
-    @State private var isHowToUseExpanded = false
-    @State private var isCommandModeGuideExpanded = false
-    @State private var isEditModeGuideExpanded = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.theme) private var theme
-
     let accessibilityEnabled: Bool
-    let stopAndProcessTranscription: () async -> Void
-    let startRecording: () -> Void
     let openAccessibilitySettings: () -> Void
-    let restartApp: () -> Void
-
-    private var commandModeShortcutDisplay: String {
-        self.settings.commandModeHotkeyShortcut?.displayString ?? "Not set"
-    }
-
-    private var writeModeShortcutDisplay: String {
-        self.settings.rewriteModeHotkeyShortcut.displayString
-    }
-
-    private let playgroundSectionID = "welcome-playground-section"
-
-    private var commandModeColor: Color {
-        self.theme.palette.warning
-    }
-
-    private var editModeColor: Color {
-        self.theme.palette.accent
-    }
-
-    private var isAIEnhancementReady: Bool {
-        DictationAIPostProcessingGate.isProviderConfigured()
-    }
-
-    private var appDisplayName: String {
-        Bundle.main.fluidAppDisplayName
-    }
+    let openFluidIntelligenceDemo: () -> Void
+    let openShortcutSettings: () -> Void
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "book.fill")
-                            .font(self.theme.typography.titleIcon)
-                            .foregroundStyle(self.theme.palette.accent)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text((self.asr.isAsrReady || self.asr.modelsExistOnDisk) ? "Getting Started" : "Welcome to FluidVoice")
-                                .font(self.theme.typography.title)
-                            Text("Talk anywhere. FluidVoice types for you.")
-                                .font(self.theme.typography.bodySmall)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.bottom, 4)
-
-                    // Quick Setup Checklist
-                    ThemedCard(style: .prominent) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 10) {
-                                Label("Quick Setup", systemImage: "checkmark.circle.fill")
-                                    .font(self.theme.typography.sectionTitle)
-                                    .foregroundStyle(self.theme.palette.accent)
-
-                                Spacer()
-
-                                Button {
-                                    self.settings.resetOnboardingProgress()
-                                    self.playgroundUsed = false
-                                } label: {
-                                    Label("Run Onboarding Again", systemImage: "arrow.counterclockwise")
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                            }
-
-                            VStack(alignment: .leading, spacing: 8) {
-                                SetupStepView(
-                                    step: 1,
-                                    // Consider model step complete if ready OR downloaded (even if not loaded)
-                                    title: (self.asr.isAsrReady || self.asr.modelsExistOnDisk) ? "Voice Model Ready" : "Download Voice Model",
-                                    description: self.asr.isAsrReady
-                                        ? "Speech recognition model is loaded and ready"
-                                        : (
-                                            self.asr.modelsExistOnDisk
-                                                ? "Model downloaded, will load when needed"
-                                                : "Download the AI model for offline voice transcription (~500MB)"
-                                        ),
-                                    status: (self.asr.isAsrReady || self.asr.modelsExistOnDisk) ? .completed : .pending,
-                                    action: {
-                                        self.selectedSidebarItem = .voiceEngine
-                                    },
-                                    actionButtonTitle: "Go to Voice Engine",
-                                    showActionButton: !(self.asr.isAsrReady || self.asr.modelsExistOnDisk)
-                                )
-
-                                SetupStepView(
-                                    step: 2,
-                                    title: self.asr.micStatus == .authorized ? "Microphone Permission Granted" : "Grant Microphone Permission",
-                                    description: self.asr.micStatus == .authorized
-                                        ? "FluidVoice has access to your microphone"
-                                        : "Allow FluidVoice to access your microphone for voice input",
-                                    status: self.asr.micStatus == .authorized ? .completed : .pending,
-                                    action: {
-                                        if self.asr.micStatus == .notDetermined {
-                                            self.asr.requestMicAccess()
-                                        } else if self.asr.micStatus == .denied {
-                                            self.asr.openSystemSettingsForMic()
-                                        }
-                                    },
-                                    actionButtonTitle: self.asr.micStatus == .notDetermined ? "Grant Access" : "Open Settings",
-                                    showActionButton: self.asr.micStatus != .authorized
-                                )
-
-                                SetupStepView(
-                                    step: 3,
-                                    title: self.accessibilityEnabled ? "Accessibility Access Enabled" : "Enable Accessibility Access",
-                                    description: self.accessibilityEnabled
-                                        ? "Accessibility permission granted for typing into apps"
-                                        : "Drag \(self.appDisplayName) into the Accessibility apps list as shown",
-                                    status: self.accessibilityEnabled ? .completed : .pending,
-                                    action: {
-                                        self.openAccessibilitySettings()
-                                    },
-                                    actionButtonTitle: "Open Settings",
-                                    showActionButton: !self.accessibilityEnabled
-                                )
-
-                                SetupStepView(
-                                    step: 4,
-                                    title: self.isAIEnhancementReady ? "AI Enhancement Configured" : "Set Up AI Enhancement (Optional)",
-                                    description: self.isAIEnhancementReady
-                                        ? "AI-powered text enhancement is ready to use"
-                                        : "Configure API keys for AI-powered text enhancement",
-                                    status: self.isAIEnhancementReady ? .completed : .pending,
-                                    action: {
-                                        self.selectedSidebarItem = .aiEnhancements
-                                    },
-                                    actionButtonTitle: "Configure AI"
-                                )
-
-                                SetupStepView(
-                                    step: 5,
-                                    title: self.playgroundUsed ? "Setup Tested Successfully" : "Test Your Setup",
-                                    description: self.playgroundUsed
-                                        ? "You've successfully tested voice transcription"
-                                        : "Try the playground below to test your complete setup",
-                                    status: self.playgroundUsed ? .completed : .pending,
-                                    action: {
-                                        withAnimation(.easeInOut(duration: 0.25)) {
-                                            proxy.scrollTo(self.playgroundSectionID, anchor: .top)
-                                        }
-                                        self.isTranscriptionFocused.wrappedValue = true
-                                    },
-                                    actionButtonTitle: "Go to Playground",
-                                    showActionButton: !self.playgroundUsed
-                                )
-                                .id("playground-step-\(self.playgroundUsed)")
-                            }
-                        }
-                        .padding(14)
-                    }
-
-                    // Test Playground
-                    ThemedCard(hoverEffect: false) {
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack {
-                                Label {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Test Playground")
-                                            .font(self.theme.typography.sectionTitle)
-                                        Text("Click record, speak, and see your transcription")
-                                            .font(self.theme.typography.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                } icon: {
-                                    Image(systemName: "text.bubble")
-                                        .font(self.theme.typography.titleIcon)
-                                }
-
-                                Spacer()
-
-                                if self.asr.isRunning {
-                                    HStack(spacing: 6) {
-                                        Circle()
-                                            .fill(.red)
-                                            .frame(width: 6, height: 6)
-                                        Text("Recording...")
-                                            .font(self.theme.typography.captionStrong)
-                                            .foregroundStyle(.red)
-                                    }
-                                } else if !self.asr.finalText.isEmpty {
-                                    Text("\(self.asr.finalText.count) characters")
-                                        .font(self.theme.typography.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if self.settings.selectedSpeechModel == .parakeetTDT || self.settings.selectedSpeechModel == .parakeetTDTv2 {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "text.magnifyingglass")
-                                        .font(self.theme.typography.caption)
-                                        .foregroundStyle(self.theme.palette.accent)
-                                    Text(self.asr.wordBoostStatusText)
-                                        .font(self.theme.typography.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .fill(self.theme.palette.contentBackground.opacity(0.6))
-                                )
-                            }
-
-                            VStack(alignment: .leading, spacing: 14) {
-                                // Recording Control — centered button
-                                HStack {
-                                    Spacer()
-                                    Button {
-                                        if self.asr.isRunning {
-                                            Task {
-                                                await self.stopAndProcessTranscription()
-                                            }
-                                        } else {
-                                            self.startRecording()
-                                            self.playgroundUsed = true
-                                            SettingsStore.shared.playgroundUsed = true
-                                        }
-                                    } label: {
-                                        HStack(spacing: 8) {
-                                            Image(systemName: self.asr.isRunning ? "stop.fill" : "mic.fill")
-                                            Text(self.asr.isRunning ? "Stop Recording" : "Start Recording")
-                                        }
-                                        .frame(maxWidth: 220)
-                                    }
-                                    .fluidButton(.primary, size: .large, isRecording: self.asr.isRunning)
-                                    .buttonHoverEffect()
-                                    .scaleEffect(!self.reduceMotion && self.asr.isRunning ? 1.02 : 1.0)
-                                    .animation(self.reduceMotion ? nil : .spring(response: 0.3), value: self.asr.isRunning)
-                                    .disabled(!self.asr.isAsrReady && !self.asr.isRunning)
-                                    Spacer()
-                                }
-
-                                // Text Area
-                                VStack(alignment: .leading, spacing: 8) {
-                                    TextEditor(text: Binding(
-                                        get: { self.asr.finalText },
-                                        set: { self.asr.finalText = $0 }
-                                    ))
-                                    .font(self.theme.typography.body)
-                                    .focused(self.isTranscriptionFocused)
-                                    .frame(height: 120)
-                                    .padding(10)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(
-                                                self.asr.isRunning ? self.theme.palette.accent.opacity(0.06) : self.theme.palette.cardBackground
-                                            )
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .strokeBorder(
-                                                        self.asr.isRunning ? self.theme.palette.accent.opacity(0.4) : self.theme.palette.cardBorder.opacity(0.6),
-                                                        lineWidth: self.asr.isRunning ? 2 : 1
-                                                    )
-                                            )
-                                    )
-                                    .scrollContentBackground(.hidden)
-                                    .overlay(
-                                        VStack(spacing: 8) {
-                                            if self.asr.isRunning {
-                                                Image(systemName: "waveform")
-                                                    .font(self.theme.typography.titleIcon)
-                                                    .foregroundStyle(self.theme.palette.accent)
-                                                Text("Listening... Speak now!")
-                                                    .font(self.theme.typography.bodySmallStrong)
-                                                    .foregroundStyle(self.theme.palette.accent)
-                                                Text("Transcription will appear when you stop recording")
-                                                    .font(self.theme.typography.caption)
-                                                    .foregroundStyle(self.theme.palette.accent.opacity(0.7))
-                                            } else if self.asr.finalText.isEmpty {
-                                                Image(systemName: "text.bubble")
-                                                    .font(self.theme.typography.titleIcon)
-                                                    .foregroundStyle(.secondary.opacity(0.5))
-                                                Text("Press record or your hotkey to begin")
-                                                    .font(self.theme.typography.caption)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        .allowsHitTesting(false)
-                                    )
-
-                                    if !self.asr.finalText.isEmpty {
-                                        HStack(spacing: 8) {
-                                            Button {
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(self.asr.finalText, forType: .string)
-                                            } label: {
-                                                Label("Copy Text", systemImage: "doc.on.doc")
-                                            }
-                                            .buttonStyle(.borderedProminent)
-                                            .tint(self.theme.palette.accent)
-                                            .controlSize(.small)
-
-                                            Button("Clear & Test Again") {
-                                                self.asr.finalText = ""
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
-
-                                            Spacer()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        .padding(16)
-                    }
-                    .id(self.playgroundSectionID)
-
-                    // Secondary guidance
-                    ThemedCard(style: .subtle) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            self.guideDisclosureRow(
-                                title: "How to Use",
-                                systemImage: "play.fill",
-                                color: self.theme.palette.accent,
-                                isExpanded: self.$isHowToUseExpanded
-                            ) {
-                                EmptyView()
-                            } content: {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    self.howToStep(number: 1, title: "Start Recording", description: "Press your hotkey (default: Right Option/Alt) or click the button")
-                                    self.howToStep(number: 2, title: "Speak Clearly", description: "Speak naturally - works best in quiet environments")
-                                    self.howToStep(number: 3, title: "Auto-Type Result", description: "Transcription is automatically typed into your focused app")
-                                }
-                            }
-
-                            Divider().opacity(0.2)
-
-                            self.guideDisclosureRow(
-                                title: "Command Mode",
-                                systemImage: "terminal.fill",
-                                color: self.commandModeColor,
-                                isExpanded: self.$isCommandModeGuideExpanded
-                            ) {
-                                self.featureBadge("New", color: self.commandModeColor)
-                                self.featureBadge("Alpha", color: self.commandModeColor.opacity(0.75))
-                            } content: {
-                                self.commandModeGuide
-                            }
-
-                            Divider().opacity(0.2)
-
-                            self.guideDisclosureRow(
-                                title: "Edit Mode",
-                                systemImage: "pencil.and.outline",
-                                color: self.editModeColor,
-                                isExpanded: self.$isEditModeGuideExpanded
-                            ) {
-                                self.featureBadge("New", color: self.editModeColor)
-                            } content: {
-                                self.editModeGuide
-                            }
-                        }
-                        .padding(12)
-                    }
-                }
-                .padding(16)
-            }
-        }
-        .onAppear {
-            Task { @MainActor in
-                await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
-                await AudioStartupGate.shared.waitUntilOpen()
-                self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-                await self.asr.checkIfModelsExistAsync()
-            }
-        }
-    }
-
-    // MARK: - Helper Views
-
-    private func guideDisclosureRow<Accessories: View, Content: View>(
-        title: String,
-        systemImage: String,
-        color: Color,
-        isExpanded: Binding<Bool>,
-        @ViewBuilder accessories: () -> Accessories,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(self.reduceMotion ? nil : .easeInOut(duration: 0.16)) {
-                    isExpanded.wrappedValue.toggle()
-                }
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary.opacity(0.85))
-                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
-                        .frame(width: 16)
-
-                    Label(title, systemImage: systemImage)
-                        .font(self.theme.typography.sectionTitle)
-                        .foregroundStyle(color)
-
-                    accessories()
-
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(Text(title))
-            .accessibilityValue(Text(isExpanded.wrappedValue ? "Expanded" : "Collapsed"))
-            .accessibilityHint(Text("Activates to expand or collapse"))
-
-            if isExpanded.wrappedValue {
-                content()
-                    .padding(.top, 8)
-                    .padding(.leading, 26)
-            }
-        }
-    }
-
-    private var commandModeGuide: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Control your Mac with voice commands. Execute terminal commands, open apps, and more.")
-                    .font(self.theme.typography.bodySmall)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Button("Open") {
-                    self.selectedSidebarItem = .commandMode
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Getting Started")
-                    .font(self.theme.typography.bodySmallStrong)
-                    .foregroundStyle(self.commandModeColor)
-
-                HStack(spacing: 4) {
-                    Text("Press")
-                    self.keyboardBadge(self.commandModeShortcutDisplay)
-                    Text("to open, speak your command, then press again to send.")
-                }
-                .font(self.theme.typography.caption)
-                .foregroundStyle(.primary.opacity(0.8))
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Examples")
-                    .font(self.theme.typography.bodySmallStrong)
-                    .foregroundStyle(self.commandModeColor)
-                self.commandModeExample(icon: "folder", text: "\"List files in my Downloads folder\"")
-                self.commandModeExample(icon: "plus.rectangle.on.folder", text: "\"Create a folder called Projects on Desktop\"")
-                self.commandModeExample(icon: "network", text: "\"What's my IP address?\"")
-                self.commandModeExample(icon: "safari", text: "\"Open Safari\"")
-            }
-
-            HStack(spacing: 4) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(self.theme.typography.captionSmall)
-                    .foregroundStyle(self.commandModeColor)
-                Text("AI can make mistakes. Avoid destructive commands.")
-                    .font(self.theme.typography.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var editModeGuide: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("AI-powered editing assistant. Write fresh content or edit selected text with voice.")
-                    .font(self.theme.typography.bodySmall)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Button("Open AI Settings") {
-                    self.selectedSidebarItem = .aiEnhancements
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
-            Label("Configure an AI model provider in AI Settings before using Edit Mode.", systemImage: "info.circle")
-                .font(self.theme.typography.caption)
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 10) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Create New Text")
-                        .font(self.theme.typography.bodySmallStrong)
-                        .foregroundStyle(self.editModeColor)
-
-                    HStack(spacing: 4) {
-                        Text("Press")
-                        self.keyboardBadge(self.writeModeShortcutDisplay)
-                        Text("and speak what you want to write.")
-                    }
-                    .font(self.theme.typography.caption)
-                    .foregroundStyle(.primary.opacity(0.8))
-
-                    self.writeModeExample(text: "\"Write an email asking for time off\"")
-                    self.writeModeExample(text: "\"Draft a thank you note\"")
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Edit Selected Text")
-                        .font(self.theme.typography.bodySmallStrong)
-                        .foregroundStyle(self.editModeColor)
-
-                    HStack(spacing: 4) {
-                        Text("Select text first, then press")
-                        self.keyboardBadge(self.writeModeShortcutDisplay)
-                        Text("and speak your instruction.")
-                    }
-                    .font(self.theme.typography.caption)
-                    .foregroundStyle(.primary.opacity(0.8))
-
-                    self.writeModeExample(text: "\"Make this more formal\"")
-                    self.writeModeExample(text: "\"Fix grammar and spelling\"")
-                    self.writeModeExample(text: "\"Summarize this\"")
-                }
-            }
-        }
-    }
-
-    private func howToStep(number: Int, title: String, description: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            ZStack {
-                Circle()
-                    .fill(self.theme.palette.accent.opacity(0.15))
-                    .frame(width: 28, height: 28)
-                Text("\(number)")
-                    .font(self.theme.typography.captionStrong)
-                    .foregroundStyle(self.theme.palette.accent)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(self.theme.typography.bodyStrong)
-                Text(description)
-                    .font(self.theme.typography.bodySmall)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-    }
-
-    private func featureBadge(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(self.theme.typography.badge)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-    }
-
-    private func keyboardBadge(_ text: String) -> some View {
-        Text(text)
-            .font(self.theme.typography.captionStrong)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(self.theme.palette.cardBackground.opacity(0.7), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-    }
-
-    private func commandModeExample(icon: String, text: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(self.theme.typography.captionSmall)
-                .foregroundStyle(self.commandModeColor.opacity(0.8))
-                .frame(width: 14)
-            Text(text)
-                .font(self.theme.typography.caption)
-                .foregroundStyle(.primary.opacity(0.8))
-        }
-    }
-
-    private func writeModeExample(text: String) -> some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(self.editModeColor.opacity(0.6))
-                .frame(width: 4, height: 4)
-            Text(text)
-                .font(self.theme.typography.caption)
-                .foregroundStyle(.primary.opacity(0.8))
+        DashboardView(
+            asr: self.appServices.asr,
+            selectedSidebarItem: self.$selectedSidebarItem,
+            accessibilityEnabled: self.accessibilityEnabled,
+            openAccessibilitySettings: self.openAccessibilitySettings,
+            openFluidIntelligenceDemo: self.openFluidIntelligenceDemo,
+            openShortcutSettings: self.openShortcutSettings
+        )
+        .task {
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard !Task.isCancelled else { return }
+            self.appServices.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+            await self.appServices.asr.checkIfModelsExistAsync()
         }
     }
 }
@@ -628,6 +60,8 @@ struct OnboardingFlowView: View {
     }
 
     @ObservedObject private var settings = SettingsStore.shared
+    @ObservedObject private var installations = SpeechModelInstallationSnapshot.shared
+    @StateObject private var aiSetup = OnboardingAISetupController.live
 
     @Binding var currentStep: Int
     let accessibilityEnabled: Bool
@@ -635,7 +69,6 @@ struct OnboardingFlowView: View {
     let markAISkipped: () -> Void
     let finishOnboarding: () -> Void
     let finishOnboardingAtGettingStarted: () -> Void
-    let openAIEnhancementSettingsFromOnboarding: () -> Void
     let openAccessibilitySettings: () -> Void
     let restartApp: () -> Void
     let menuBarManager: MenuBarManager
@@ -647,6 +80,7 @@ struct OnboardingFlowView: View {
     @State private var selectedModelRouteID: String?
     @State private var hoveredLanguageID: String?
     @State private var hoveredModelRouteID: String?
+    @State private var hoveredModelInfoRouteID: String?
     @State private var hoveredModelActionButtonID: String?
     @State private var hoveredPermissionButtonID: String?
     @State private var onboardingInputDevices: [AudioDevice.Device] = []
@@ -660,6 +94,7 @@ struct OnboardingFlowView: View {
     @State private var isOnboardingFlowVisible = false
     @State private var hoveredFooterButton: OnboardingFooterButton?
     @State private var isShowingAllLanguages = false
+    @State private var otherModelsPage = 0
     @State private var isShowingOtherModelRoutes = false
     @State private var preparingModelRouteID: String?
     @State private var uninstallingModelRouteID: String?
@@ -681,6 +116,7 @@ struct OnboardingFlowView: View {
         case primary
         case secondary
         case destructive
+        case update
     }
 
     private struct OnboardingPillButtonConfiguration {
@@ -793,36 +229,11 @@ struct OnboardingFlowView: View {
         return self.selectedLanguageRoutes.first
     }
 
-    private var primaryDisplayedModelRoute: VoiceEngineLanguageRoute? {
-        self.selectedLanguageRoutes.first
-    }
-
     private var defaultDisplayedModelRoutes: [VoiceEngineLanguageRoute] {
-        var routes: [VoiceEngineLanguageRoute] = []
-        if let primaryDisplayedModelRoute {
-            routes.append(primaryDisplayedModelRoute)
-        }
-        if let builtInRoute = self.defaultBuiltInModelRoute,
-           !routes.contains(where: { $0.id == builtInRoute.id })
-        {
-            routes.append(builtInRoute)
-        }
-        return routes
-    }
-
-    private var defaultBuiltInModelRoute: VoiceEngineLanguageRoute? {
-        guard self.selectedOnboardingLanguage.id == "en" else {
-            return nil
-        }
-
-        return self.selectedLanguageRoutes.first { route in
-            switch route.model {
-            case .appleSpeech, .appleSpeechAnalyzer:
-                return true
-            default:
-                return false
-            }
-        }
+        OnboardingModelRecommendation.defaultRoutes(
+            forLanguageID: self.selectedOnboardingLanguage.id,
+            from: self.selectedLanguageRoutes
+        )
     }
 
     private var otherModelRoutes: [VoiceEngineLanguageRoute] {
@@ -863,6 +274,7 @@ struct OnboardingFlowView: View {
         }
         return self.preparingModelRouteID != nil
             || self.asr.hasActiveModelPreparation
+            || self.asr.hasActiveModelDownload
             || self.asr.isCancellingModelPreparation
             || self.asr.isDownloadingModel
             || (self.asr.isLoadingModel && !self.asr.isAsrReady)
@@ -881,7 +293,7 @@ struct OnboardingFlowView: View {
     }
 
     private var isAIReady: Bool {
-        self.settings.onboardingAISkipped || DictationAIPostProcessingGate.isProviderConfigured()
+        self.settings.onboardingAISkipped || DictationAIPostProcessingGate.isOnboardingChoiceConfigured()
     }
 
     private var isPlaygroundReady: Bool {
@@ -941,18 +353,16 @@ struct OnboardingFlowView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
         .background {
-            ZStack {
-                self.theme.palette.windowBackground
-                    .opacity(0.98)
-                    .ignoresSafeArea()
-
-                Rectangle()
-                    .fill(self.theme.materials.window)
-                    .opacity(0.75)
-                    .ignoresSafeArea()
-            }
+            FluidOnboardingWindowTransparency()
         }
         .onAppear {
+            self.installations.refresh()
+            Task {
+                let catalog = CompactSpeechModelReleaseCatalog.shared
+                let revision = catalog.revision
+                await catalog.refreshIfNeeded()
+                if catalog.revision != revision { self.installations.refresh() }
+            }
             self.isOnboardingFlowVisible = true
             self.syncOnboardingSelectionFromSettings()
             self.playLandingWelcomeSoundIfNeeded()
@@ -993,7 +403,7 @@ struct OnboardingFlowView: View {
                 self.suspendOnboardingMicrophonePreviewForDictation()
             }
         }
-        .onChange(of: self.asr.audioCaptureStateSettledTick) { _, _ in
+        .onReceive(self.asr.audioCaptureStateDidSettle) {
             guard self.isOnboardingFlowVisible,
                   self.step == .permissions,
                   self.isMicrophoneReady
@@ -1087,29 +497,28 @@ struct OnboardingFlowView: View {
             let landing = self.theme.metrics.onboardingSurface.landing
 
             ZStack {
-                VStack(alignment: .center, spacing: self.theme.metrics.onboardingSurface.landing.sectionSpacing) {
-                    FluidOnboardingLandingHero(
-                        eyebrow: "",
-                        title: "Just speak.",
-                        accentTitle: "We'll handle the rest.",
-                        firstDetail: "Accurate. Fast. Private. Free.",
-                        secondDetail: "Built for creators, thinkers, and builders."
-                    ) {
-                        FluidOnboardingLandingPrimaryButton(title: "Next") {
-                            self.goNext()
-                        }
-                        .frame(
-                            width: FluidOnboardingLandingPrimaryButton.size.width,
-                            height: FluidOnboardingLandingPrimaryButton.size.height
-                        )
+                VStack(spacing: 0) {
+                    OnboardingFittedContent(width: landing.contentWidth + 48) {
+                        FluidOnboardingLandingHero(
+                            eyebrow: "",
+                            title: "Just speak.",
+                            accentTitle: "We'll handle the rest.",
+                            firstDetail: "Accurate. Fast. Private. Free.",
+                            secondDetail: "Built for creators, thinkers, and builders."
+                        ) { EmptyView() }
+                            .padding(24)
                     }
+                    HStack {
+                        Spacer()
+                        FluidOnboardingLandingPrimaryButton(title: "Next") { self.goNext() }
+                            .frame(
+                                width: FluidOnboardingLandingPrimaryButton.size.width,
+                                height: FluidOnboardingLandingPrimaryButton.size.height
+                            )
+                    }
+                    .padding(.horizontal, FluidOnboardingLayout.footerHorizontalInset)
+                    .padding(.bottom, FluidOnboardingLayout.footerBottomInset)
                 }
-                .frame(width: landing.contentWidth, alignment: .center)
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: proxy.size.height, alignment: .center)
-                .offset(y: -78)
-                .padding(.horizontal, 24)
-                .padding(.vertical, 24)
 
                 FluidOnboardingLandingHoverTracker(
                     onMove: { location, size in
@@ -1178,20 +587,20 @@ struct OnboardingFlowView: View {
                     FluidOnboardingCompactProgress(value: self.compactProgressValue)
                         .padding(.top, 28)
 
-                    ScrollView(.vertical, showsIndicators: false) {
+                    OnboardingFittedContent(width: 760) {
                         VStack(spacing: 0) {
                             FluidOnboardingCompactAppIconMark(size: 66)
                                 .padding(.bottom, 22)
 
                             Text("What language will\nyou speak most?")
-                                .font(.system(size: 28, weight: .semibold))
+                                .font(.fluidSystem(size: 28, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .lineSpacing(4)
                                 .padding(.bottom, 18)
 
                             Text("We'll show the best voice engines for it.")
-                                .font(.system(size: 15, weight: .medium))
+                                .font(.fluidSystem(size: 15, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.62))
                                 .padding(.bottom, 26)
 
@@ -1217,7 +626,7 @@ struct OnboardingFlowView: View {
                             }
 
                             Text("You can change this later in Voice Engine settings.")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.fluidSystem(size: 12, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.44))
                                 .padding(.top, 18)
                         }
@@ -1274,12 +683,12 @@ struct OnboardingFlowView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "globe")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.fluidSystem(size: 17, weight: .semibold))
                     .foregroundStyle(isSelected ? FluidOnboardingLandingColors.blue : Color.white.opacity(0.72))
                     .frame(width: 22)
 
                 Text(language.popularDisplayName)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.fluidSystem(size: 15, weight: .semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .minimumScaleFactor(0.76)
@@ -1288,7 +697,7 @@ struct OnboardingFlowView: View {
 
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(.fluidSystem(size: 12, weight: .bold))
                         .foregroundStyle(FluidOnboardingLandingColors.blue)
                 }
             }
@@ -1346,12 +755,12 @@ struct OnboardingFlowView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 18, weight: .bold))
+                    .font(.fluidSystem(size: 18, weight: .bold))
                     .foregroundStyle(isSelected ? FluidOnboardingLandingColors.blue : Color.white.opacity(self.isShowingAllLanguages ? 0.78 : 0.72))
                     .frame(width: 22)
 
                 Text(isSelected ? self.selectedOnboardingLanguage.displayName : "Other")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.fluidSystem(size: 15, weight: .semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .minimumScaleFactor(0.70)
@@ -1359,7 +768,7 @@ struct OnboardingFlowView: View {
                 Spacer(minLength: 0)
 
                 Image(systemName: self.isShowingAllLanguages ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.fluidSystem(size: 10, weight: .bold))
                     .foregroundStyle(Color.white.opacity(0.46))
             }
             .padding(.horizontal, 15)
@@ -1390,7 +799,7 @@ struct OnboardingFlowView: View {
         VStack(spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.fluidSystem(size: 13, weight: .semibold))
                     .foregroundStyle(Color.white.opacity(0.48))
 
                 TextField(
@@ -1400,7 +809,7 @@ struct OnboardingFlowView: View {
                         .foregroundStyle(Color.white.opacity(0.42))
                 )
                 .textFieldStyle(.plain)
-                .font(.system(size: 14, weight: .medium))
+                .font(.fluidSystem(size: 14, weight: .medium))
                 .foregroundStyle(.white)
                 .focused(self.$isLanguageSearchFocused)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1420,23 +829,13 @@ struct OnboardingFlowView: View {
                     )
             )
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(spacing: 6) {
-                    ForEach(self.searchedOnboardingLanguages) { language in
-                        self.languageSearchRow(for: language)
-                    }
+            Menu("Choose a language") {
+                ForEach(self.searchedOnboardingLanguages) { language in
+                    Button(language.displayName) { self.selectOnboardingLanguage(language) }
                 }
-                .padding(8)
             }
-            .frame(width: 530, height: 156)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.white.opacity(0.045))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    )
-            )
+            .fluidDropdownStyle()
+            .frame(width: 530)
         }
     }
 
@@ -1448,14 +847,14 @@ struct OnboardingFlowView: View {
         } label: {
             HStack(spacing: 10) {
                 Text(language.displayName)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.fluidSystem(size: 13, weight: .semibold))
                     .foregroundStyle(.white)
 
                 Spacer()
 
                 if isSelected {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.fluidSystem(size: 13, weight: .bold))
                         .foregroundStyle(FluidOnboardingLandingColors.blue)
                 }
             }
@@ -1512,8 +911,8 @@ struct OnboardingFlowView: View {
             }
             .keyboardShortcut(.defaultAction)
         }
-        .padding(.horizontal, 30)
-        .padding(.bottom, 24)
+        .padding(.horizontal, FluidOnboardingLayout.footerHorizontalInset)
+        .padding(.bottom, FluidOnboardingLayout.footerBottomInset)
     }
 
     private func cinematicFooterButton(
@@ -1638,13 +1037,13 @@ struct OnboardingFlowView: View {
                     FluidOnboardingCompactProgress(value: self.compactProgressValue)
                         .padding(.top, 28)
 
-                    ScrollView(.vertical, showsIndicators: self.isShowingOtherModelRoutes) {
+                    OnboardingFittedContent(width: 760) {
                         VStack(spacing: 0) {
                             FluidOnboardingCompactAppIconMark(size: 66)
                                 .padding(.bottom, 22)
 
                             Text("Choose your\nvoice engine")
-                                .font(.system(size: 28, weight: .semibold))
+                                .font(.fluidSystem(size: 28, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .lineSpacing(4)
@@ -1652,13 +1051,13 @@ struct OnboardingFlowView: View {
                                 .padding(.bottom, 16)
 
                             Text(self.recommendedModelReasonText)
-                                .font(.system(size: 15, weight: .medium))
+                                .font(.fluidSystem(size: 15, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.62))
                                 .multilineTextAlignment(.center)
                                 .padding(.bottom, 14)
 
                             Text(self.selectedOnboardingLanguage.displayName)
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.fluidSystem(size: 13, weight: .semibold))
                                 .foregroundStyle(FluidOnboardingLandingColors.blue)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
@@ -1670,7 +1069,7 @@ struct OnboardingFlowView: View {
                                 .padding(.bottom, 18)
 
                             VStack(spacing: 10) {
-                                let defaultRoutes = self.defaultDisplayedModelRoutes
+                                let defaultRoutes = self.isShowingOtherModelRoutes ? [] : self.defaultDisplayedModelRoutes
                                 if defaultRoutes.count == 1, let route = defaultRoutes.first {
                                     self.onboardingRouteCard(for: route)
                                 } else if !defaultRoutes.isEmpty {
@@ -1693,10 +1092,21 @@ struct OnboardingFlowView: View {
                                         ],
                                         spacing: 16
                                     ) {
-                                        ForEach(self.otherModelRoutes) { route in
+                                        let page = min(self.otherModelsPage, max(0, (self.otherModelRoutes.count - 1) / 2))
+                                        ForEach(Array(self.otherModelRoutes.dropFirst(page * 2).prefix(2))) { route in
                                             self.onboardingRouteCard(for: route, enablesHover: false)
                                         }
                                     }
+                                    HStack(spacing: 16) {
+                                        let lastPage = max(0, (self.otherModelRoutes.count - 1) / 2)
+                                        let page = min(self.otherModelsPage, lastPage)
+                                        Button("Previous models") { self.otherModelsPage = max(0, page - 1) }
+                                            .disabled(page == 0)
+                                        Text("\(page + 1) / \(lastPage + 1)")
+                                        Button("Next models") { self.otherModelsPage = min(lastPage, page + 1) }
+                                            .disabled(page == lastPage)
+                                    }
+                                    .font(self.theme.typography.caption)
                                 }
                             }
                             .frame(maxWidth: .infinity)
@@ -1707,9 +1117,9 @@ struct OnboardingFlowView: View {
                             .frame(width: 608)
 
                             if self.isModelPreparationInProgress {
-                                Label("Initial preparation can take a while to get your Mac ready for near-instant transcription.", systemImage: "clock.arrow.circlepath")
+                                Label("First-time setup can take a few minutes while your Mac prepares the model. Please keep FluidVoice open.", systemImage: "clock.arrow.circlepath")
                                     .font(self.theme.typography.captionStrong)
-                                    .foregroundStyle(Color.white.opacity(0.58))
+                                    .foregroundStyle(self.theme.palette.warning)
                                     .labelStyle(.titleAndIcon)
                                     .lineLimit(1)
                                     .minimumScaleFactor(0.86)
@@ -1717,14 +1127,14 @@ struct OnboardingFlowView: View {
                                     .padding(.vertical, 5)
                                     .background(
                                         Capsule()
-                                            .fill(Color.white.opacity(0.06))
-                                            .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 1))
+                                            .fill(self.theme.palette.warning.opacity(0.10))
+                                            .overlay(Capsule().stroke(self.theme.palette.warning.opacity(0.24), lineWidth: 1))
                                     )
                                     .padding(.top, 14)
                             }
 
                             Text("You can switch models later in Voice Engine settings.")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.fluidSystem(size: 12, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.44))
                                 .padding(.top, self.isModelPreparationInProgress ? 8 : 18)
                         }
@@ -1764,20 +1174,20 @@ struct OnboardingFlowView: View {
                     FluidOnboardingCompactProgress(value: self.compactProgressValue)
                         .padding(.top, 28)
 
-                    ScrollView(.vertical, showsIndicators: false) {
+                    OnboardingFittedContent(width: 760) {
                         VStack(spacing: 0) {
                             FluidOnboardingCompactAppIconMark(size: 66)
                                 .padding(.bottom, 22)
 
                             Text("Let FluidVoice\nlisten and type")
-                                .font(.system(size: 28, weight: .semibold))
+                                .font(.fluidSystem(size: 28, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .lineSpacing(4)
                                 .padding(.bottom, 16)
 
                             Text("Two quick permissions make dictation work anywhere.")
-                                .font(.system(size: 15, weight: .medium))
+                                .font(.fluidSystem(size: 15, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.62))
                                 .padding(.bottom, 28)
 
@@ -1820,7 +1230,7 @@ struct OnboardingFlowView: View {
 
                                 if !self.isAccessibilityReady {
                                     Text("Already enabled it? FluidVoice will update when macOS confirms access.")
-                                        .font(.system(size: 12, weight: .medium))
+                                        .font(.fluidSystem(size: 12, weight: .medium))
                                         .foregroundStyle(Color.white.opacity(0.42))
                                         .padding(.top, 2)
                                 }
@@ -1854,54 +1264,6 @@ struct OnboardingFlowView: View {
         }
     }
 
-    private var aiEnhancementStep: some View {
-        OnboardingAIEnhancementStepView(
-            finalText: Binding(
-                get: { self.asr.finalText },
-                set: { self.asr.finalText = $0 }
-            ),
-            progressValue: self.compactProgressValue,
-            glowCenter: self.landingGlowCenter,
-            language: self.selectedOnboardingLanguage,
-            shortcutDisplay: self.onboardingShortcutDisplay,
-            isTestReady: self.isPlaygroundReady,
-            isRunning: self.asr.isRunning,
-            isRecordingShortcut: self.isRecordingPrimaryShortcut,
-            shortcutRecordingMessage: self.isRecordingPrimaryShortcut ? self.shortcutRecordingMessage : nil,
-            onGlowMove: self.updateLandingGlow(location:in:),
-            onGlowExit: self.resetLandingGlow,
-            onBack: self.goBack,
-            onSkip: {
-                let origin = self.settings.analyticsOnboardingOrigin
-                self.markAISkipped()
-                self.finishOnboardingAtGettingStarted()
-                self.completeCurrentStep(
-                    outcome: .skipped,
-                    origin: origin,
-                    completesFlow: self.settings.onboardingCompleted
-                )
-            },
-            onUseAIProvider: {
-                let origin = self.settings.analyticsOnboardingOrigin
-                self.openAIEnhancementSettingsFromOnboarding()
-                self.completeCurrentStep(
-                    outcome: .openedSettings,
-                    origin: origin,
-                    completesFlow: self.settings.onboardingCompleted
-                )
-            },
-            onFinishSetup: {
-                let origin = self.settings.analyticsOnboardingOrigin
-                self.finishOnboardingAtGettingStarted()
-                self.completeCurrentStep(
-                    outcome: .completed,
-                    origin: origin,
-                    completesFlow: self.settings.onboardingCompleted
-                )
-            }
-        )
-    }
-
     private var playgroundStep: some View {
         GeometryReader { proxy in
             ZStack {
@@ -1911,13 +1273,13 @@ struct OnboardingFlowView: View {
                     FluidOnboardingCompactProgress(value: self.compactProgressValue)
                         .padding(.top, 28)
 
-                    ScrollView(.vertical, showsIndicators: false) {
+                    OnboardingFittedContent(width: 760) {
                         VStack(spacing: 0) {
                             FluidOnboardingCompactAppIconMark(size: 66)
                                 .padding(.bottom, 22)
 
                             Text("FluidVoice is ready.")
-                                .font(.system(size: 28, weight: .semibold))
+                                .font(.fluidSystem(size: 28, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
@@ -1926,7 +1288,7 @@ struct OnboardingFlowView: View {
                                 .padding(.bottom, 14)
 
                             Text("Now let's try it out.")
-                                .font(.system(size: 15, weight: .medium))
+                                .font(.fluidSystem(size: 15, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.62))
                                 .padding(.bottom, 28)
 
@@ -2032,9 +1394,9 @@ struct OnboardingFlowView: View {
                 Text(self.isShowingOtherModelRoutes ? "Hide other models" : "Show other models")
 
                 Image(systemName: self.isShowingOtherModelRoutes ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(.fluidSystem(size: 8, weight: .bold))
             }
-            .font(.system(size: 11, weight: .semibold))
+            .font(.fluidSystem(size: 11, weight: .semibold))
             .foregroundStyle(Color.white.opacity(0.62))
             .padding(.horizontal, 10)
             .frame(height: 24)
@@ -2071,7 +1433,7 @@ struct OnboardingFlowView: View {
     }
 
     private func isOnboardingModelBundledOrInstalled(_ model: SettingsStore.SpeechModel) -> Bool {
-        model.isInstalled
+        self.installations.isInstalled(modelID: model.id)
     }
 
     private func isPreparingOnboardingModel(_ model: SettingsStore.SpeechModel) -> Bool {
@@ -2092,7 +1454,7 @@ struct OnboardingFlowView: View {
     }
 
     private func prepareOnboardingRoute(_ route: VoiceEngineLanguageRoute) {
-        guard !self.asr.isRunning, !self.isModelPreparationInProgress, self.uninstallingModelRouteID == nil else { return }
+        guard self.installations.canUseModelActions, !self.asr.isRunning, !self.isModelPreparationInProgress, self.uninstallingModelRouteID == nil else { return }
 
         self.modelPreparationTask?.cancel()
         self.preparingModelRouteID = route.id
@@ -2124,11 +1486,15 @@ struct OnboardingFlowView: View {
 
     private func cancelOnboardingModelPreparation() {
         self.modelPreparationTask?.cancel()
-        self.asr.cancelModelPreparation()
+        if self.asr.hasActiveModelDownload {
+            self.asr.cancelModelDownload()
+        } else {
+            self.asr.cancelModelPreparation()
+        }
     }
 
     private func uninstallOnboardingRoute(_ route: VoiceEngineLanguageRoute) {
-        guard !self.asr.isRunning, !self.isModelPreparationInProgress, self.uninstallingModelRouteID == nil else { return }
+        guard self.installations.canUseModelActions, !self.asr.isRunning, !self.isModelPreparationInProgress, self.uninstallingModelRouteID == nil else { return }
 
         self.uninstallingModelRouteID = route.id
 
@@ -2154,22 +1520,26 @@ struct OnboardingFlowView: View {
         enablesHover: Bool = true
     ) -> some View {
         let model = route.model
+        let isCompactModel = [.fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro].contains(model)
         let isSelected = self.isOnboardingRouteSelected(route)
         let isHovered = enablesHover && self.hoveredModelRouteID == route.id
         let isRouteActiveInSettings = self.isRouteSelectedInSettings(route)
         let isDownloaded = self.isOnboardingModelBundledOrInstalled(model) || (isRouteActiveInSettings && (self.asr.isAsrReady || self.asr.modelsExistOnDisk))
-        let isPreparing = self.preparingModelRouteID == route.id || (isRouteActiveInSettings && (self.asr.isDownloadingModel || (self.asr.isLoadingModel && !self.asr.isAsrReady)))
+        let isPreparing = self.preparingModelRouteID == route.id || self.asr.downloadingModelId == model.id || (isRouteActiveInSettings && (self.asr.isDownloadingModel || (self.asr.isLoadingModel && !self.asr.isAsrReady)))
         let isReady = self.isOnboardingRouteReady(route)
         let isUninstalling = self.uninstallingModelRouteID == route.id
-        let areModelActionsBlocked = self.asr.isRunning || self.uninstallingModelRouteID != nil || self.preparingModelRouteID != nil || isPreparing || self.isModelPreparationInProgress
+        let areModelActionsBlocked = !self.installations.canUseModelActions || self.asr.isRunning || self.uninstallingModelRouteID != nil || self.preparingModelRouteID != nil || isPreparing || self.isModelPreparationInProgress
         let isBuiltInAppleModel = model == .appleSpeech || model == .appleSpeechAnalyzer
         let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
         let cardFill = isHovered
             ? Color(red: 0.042, green: 0.052, blue: 0.074)
             : Color(red: 0.030, green: 0.038, blue: 0.056)
 
-        return VStack(alignment: .leading, spacing: 10) {
+        return VStack(alignment: .leading, spacing: isCompactModel ? self.theme.metrics.spacing.sm : 10) {
             HStack(alignment: .top, spacing: 10) {
+                if model.brandName == "FluidVoice" {
+                    FluidVoiceBrandIcon(size: 22)
+                }
                 Text(self.onboardingModelTitle(for: model))
                     .font(self.theme.typography.sectionTitle)
                     .foregroundStyle(.white)
@@ -2184,14 +1554,24 @@ struct OnboardingFlowView: View {
                     .foregroundStyle(Color.white.opacity(0.58))
                     .frame(width: 24, height: 24)
                     .contentShape(Circle())
-                    .help(self.onboardingModelTooltip(for: route))
                     .accessibilityLabel(self.onboardingModelTooltip(for: route))
+                    .onHover { isHovered in
+                        self.hoveredModelInfoRouteID = isHovered ? route.id : nil
+                    }
             }
             .frame(height: 38, alignment: .top)
 
+            if isCompactModel {
+                Text(model.languageSupport)
+                    .font(self.theme.typography.bodySmallStrong)
+                    .foregroundStyle(Color.white.opacity(0.62))
+            }
+
             self.onboardingModelMetadataRow(badgeText: route.badgeText)
 
-            self.onboardingModelFeaturePanel(for: model)
+            if model.hasPerformanceRatings {
+                self.onboardingModelFeaturePanel(for: model)
+            }
 
             Spacer(minLength: 0)
 
@@ -2210,7 +1590,7 @@ struct OnboardingFlowView: View {
 
                 Spacer()
 
-                Text(model.downloadSize)
+                Text(self.installations.latestDescriptors[model.id]?.downloadSize ?? model.downloadSize)
                     .font(self.theme.typography.bodySmallStrong)
                     .foregroundStyle(.white)
                     .lineLimit(1)
@@ -2224,11 +1604,11 @@ struct OnboardingFlowView: View {
                     if isPreparing {
                         self.onboardingModelActionButton(
                             id: "\(route.id)-cancel",
-                            title: self.asr.isCancellingModelPreparation ? "Cancelling…" : "Cancel",
+                            title: self.asr.isCancellingModelPreparation || self.asr.isCancellingModelDownload ? "Cancelling…" : "Cancel",
                             systemImage: "xmark",
                             tone: .secondary,
                             width: 104,
-                            isDisabled: self.asr.isCancellingModelPreparation
+                            isDisabled: self.asr.isCancellingModelPreparation || self.asr.isCancellingModelDownload
                         ) {
                             self.cancelOnboardingModelPreparation()
                         }
@@ -2246,29 +1626,51 @@ struct OnboardingFlowView: View {
                 ) {
                     self.prepareOnboardingRoute(route)
                 }
+            } else if !self.installations.canUseModelActions {
+                if self.installations.isChecking {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Checking downloads…").font(self.theme.typography.bodySmall)
+                    }
+                } else {
+                    self.onboardingModelActionButton(
+                        id: "\(route.id)-retry-check",
+                        title: "Retry check",
+                        systemImage: "arrow.clockwise",
+                        tone: .primary,
+                        width: nil,
+                        isDisabled: false
+                    ) { self.installations.refresh() }
+                }
             } else if isDownloaded {
+                let hasUpdate = self.installations.updateAvailableIDs.contains(model.id)
                 HStack(spacing: 8) {
+                    if hasUpdate {
+                        self.onboardingModelActionButton(
+                            id: "\(route.id)-update",
+                            title: "Update",
+                            systemImage: "arrow.down.circle",
+                            tone: .update,
+                            width: 84,
+                            isDisabled: areModelActionsBlocked
+                        ) { self.updateOnboardingRoute(route) }
+                    }
                     self.onboardingModelActionButton(
                         id: "\(route.id)-activate",
-                        title: self.onboardingModelActionButtonTitle(isPreparing: false, isDownloaded: true, isReady: isReady),
+                        title: hasUpdate && isReady ? "Active" : self.onboardingModelActionButtonTitle(isPreparing: false, isDownloaded: true, isReady: isReady),
                         systemImage: isReady ? "checkmark" : "bolt.fill",
-                        tone: .primary,
-                        width: 124,
+                        tone: hasUpdate ? .secondary : .primary,
+                        width: hasUpdate ? 88 : 124,
                         isDisabled: areModelActionsBlocked || isReady
-                    ) {
-                        self.prepareOnboardingRoute(route)
-                    }
-
+                    ) { self.prepareOnboardingRoute(route) }
                     self.onboardingModelActionButton(
                         id: "\(route.id)-uninstall",
                         title: "Delete",
                         systemImage: "trash",
                         tone: .destructive,
-                        width: 124,
+                        width: hasUpdate ? 72 : 124,
                         isDisabled: areModelActionsBlocked
-                    ) {
-                        self.uninstallOnboardingRoute(route)
-                    }
+                    ) { self.uninstallOnboardingRoute(route) }
                 }
             } else {
                 self.onboardingModelActionButton(
@@ -2299,8 +1701,15 @@ struct OnboardingFlowView: View {
         )
         .shadow(color: Color.black.opacity(0.34), radius: isHovered ? 20 : 14, x: 0, y: isHovered ? 12 : 8)
         .contentShape(shape)
+        .overlay(alignment: .topTrailing) {
+            if self.hoveredModelInfoRouteID == route.id {
+                OnboardingModelInfoTooltip(text: self.onboardingModelTooltip(for: route), font: self.theme.typography.caption)
+                    .padding(.top, 46)
+                    .padding(.trailing, 16)
+            }
+        }
         .onTapGesture {
-            guard !areModelActionsBlocked else { return }
+            guard !areModelActionsBlocked, !self.isModelPreparationInProgress else { return }
             self.selectOnboardingRoute(route)
         }
         .onHover { isHovered in
@@ -2328,13 +1737,14 @@ struct OnboardingFlowView: View {
             )
         }
         .padding(.vertical, 2)
+        .help("Relative ratings for comparing models, not measured transcription accuracy.")
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Speed \(Int(model.speedPercent * 100)) percent. Accuracy \(Int(model.accuracyPercent * 100)) percent.")
     }
 
     private func onboardingModelPreparationStatus(isUninstalling: Bool) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            if self.asr.isCancellingModelPreparation {
+            if self.asr.isCancellingModelPreparation || self.asr.isCancellingModelDownload {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
@@ -2344,7 +1754,7 @@ struct OnboardingFlowView: View {
                         .font(self.theme.typography.captionStrong)
                         .foregroundStyle(Color.white.opacity(0.62))
                 }
-            } else if self.asr.isDownloadingModel,
+            } else if self.asr.isDownloadingModel || self.asr.hasActiveModelDownload,
                       self.asr.modelPreparationPhase == .downloading,
                       let progress = self.asr.downloadProgress
             {
@@ -2493,11 +1903,15 @@ struct OnboardingFlowView: View {
         onHover: @escaping (Bool) -> Void
     ) -> some View {
         let shape = Capsule()
-        let accentColor: Color = configuration.tone == .destructive ? .red : FluidOnboardingLandingColors.blue
-        let isFilledTone = configuration.tone == .primary || configuration.tone == .destructive
+        let accentColor: Color = switch configuration.tone {
+        case .destructive: .red
+        case .update: .orange
+        default: FluidOnboardingLandingColors.blue
+        }
+        let isFilledTone = configuration.tone != .secondary
         let fillColor: Color = {
             switch configuration.tone {
-            case .primary, .destructive:
+            case .primary, .destructive, .update:
                 return accentColor.opacity(configuration.isEnabled ? 1 : 0.34)
             case .secondary:
                 return Color.white.opacity(configuration.isEnabled ? (configuration.isHovered ? 0.11 : 0.07) : 0.045)
@@ -2505,7 +1919,7 @@ struct OnboardingFlowView: View {
         }()
         let borderColor: Color = {
             switch configuration.tone {
-            case .primary, .destructive:
+            case .primary, .destructive, .update:
                 return Color.white.opacity(configuration.isHovered && configuration.isEnabled ? 0.30 : 0)
             case .secondary:
                 return configuration.isHovered && configuration.isEnabled ? FluidOnboardingLandingColors.blue.opacity(0.30) : Color.white.opacity(0.07)
@@ -2515,7 +1929,7 @@ struct OnboardingFlowView: View {
         let shadowOpacity: Double = {
             guard configuration.isEnabled else { return 0 }
             switch configuration.tone {
-            case .primary, .destructive:
+            case .primary, .destructive, .update:
                 return configuration.isHovered ? 0.56 : 0.26
             case .secondary:
                 return configuration.isHovered ? 0.08 : 0
@@ -2529,11 +1943,11 @@ struct OnboardingFlowView: View {
             HStack(spacing: configuration.systemImage == nil ? 0 : 8) {
                 if let systemImage = configuration.systemImage {
                     Image(systemName: systemImage)
-                        .font(.system(size: configuration.iconSize, weight: .bold))
+                        .font(.fluidSystem(size: configuration.iconSize, weight: .bold))
                 }
 
                 Text(configuration.title)
-                    .font(.system(size: configuration.fontSize, weight: .semibold))
+                    .font(.fluidSystem(size: configuration.fontSize, weight: .semibold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.72)
             }
@@ -2550,7 +1964,12 @@ struct OnboardingFlowView: View {
                             .stroke(accentColor.opacity(ringOpacity), lineWidth: configuration.isHovered && configuration.isEnabled ? 1.4 : 1)
                             .padding(-2)
                     )
-                    .shadow(color: accentColor.opacity(shadowOpacity), radius: configuration.isHovered && configuration.isEnabled ? 16 : 9, x: 0, y: configuration.isHovered && configuration.isEnabled ? 6 : 3)
+                    .shadow(
+                        color: accentColor.opacity(shadowOpacity),
+                        radius: configuration.isHovered && configuration.isEnabled ? 16 : 9,
+                        x: 0,
+                        y: configuration.isHovered && configuration.isEnabled ? 6 : 3
+                    )
             )
             .contentShape(shape)
         }
@@ -2565,7 +1984,9 @@ struct OnboardingFlowView: View {
 
     private func onboardingModelTooltip(for route: VoiceEngineLanguageRoute) -> String {
         let model = route.model
-        return "\(self.onboardingModelSubtitle(for: model)) - \(model.downloadSize)\n\(model.cardDescription)"
+        let downloadSize = self.installations.latestDescriptors[model.id]?.downloadSize ?? model.downloadSize
+        let credit = model.parakeetDescriptor.map { "\n\($0.creditLine)" } ?? ""
+        return "\(self.onboardingModelSubtitle(for: model)) - \(downloadSize)\n\(model.cardDescription)\(credit)"
     }
 
     private func onboardingModelTitle(for model: SettingsStore.SpeechModel) -> String {
@@ -2578,6 +1999,8 @@ struct OnboardingFlowView: View {
             return "Parakeet v3"
         case .parakeetTDTv2:
             return "Parakeet v2"
+        case .fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro:
+            return model.displayName
         case .parakeetRealtime:
             return "Parakeet Flash"
         case .cohereTranscribeSixBit:
@@ -2614,15 +2037,15 @@ struct OnboardingFlowView: View {
 
                 if isReady {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 17, weight: .bold))
+                        .font(.fluidSystem(size: 17, weight: .bold))
                         .foregroundStyle(Color.green.opacity(0.92))
                 } else {
                     VStack(spacing: 1) {
                         Image(systemName: systemImage)
-                            .font(.system(size: 14, weight: .bold))
+                            .font(.fluidSystem(size: 14, weight: .bold))
 
                         Text("\(stepNumber)")
-                            .font(.system(size: 10, weight: .bold))
+                            .font(.fluidSystem(size: 10, weight: .bold))
                     }
                     .foregroundStyle(FluidOnboardingLandingColors.blue)
                 }
@@ -2631,11 +2054,11 @@ struct OnboardingFlowView: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     Text(title)
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.fluidSystem(size: 17, weight: .semibold))
                         .foregroundStyle(.white)
 
                     Text(resolvedStatusTitle)
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.fluidSystem(size: 10, weight: .bold))
                         .foregroundStyle(isReady ? Color.green.opacity(0.92) : FluidOnboardingLandingColors.blue)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
@@ -2646,7 +2069,7 @@ struct OnboardingFlowView: View {
                 }
 
                 Text(subtitle)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.fluidSystem(size: 12, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.55))
                     .lineLimit(2)
             }
@@ -2843,6 +2266,68 @@ struct OnboardingFlowView: View {
 }
 
 private extension OnboardingFlowView {
+    func updateOnboardingRoute(_ route: VoiceEngineLanguageRoute) {
+        guard self.installations.canUseModelActions, !self.asr.isRunning,
+              self.asr.activeExclusiveActivity == nil, !self.isModelPreparationInProgress,
+              self.uninstallingModelRouteID == nil
+        else { return }
+        self.preparingModelRouteID = route.id
+        self.modelPreparationTask = Task { @MainActor in
+            defer { self.preparingModelRouteID = nil; self.modelPreparationTask = nil }
+            do {
+                try await self.asr.downloadModel(route.model, source: .onboarding, updateWeights: true, progressHandler: nil)
+            } catch is CancellationError {
+                // The retained installation remains available.
+            } catch {
+                if let failure = error as? ParakeetArchiveDownloader.DownloadError, case .replacementCleanupFailed = failure {
+                    self.asr.errorTitle = "Model Updated"
+                } else {
+                    self.asr.errorTitle = "Model Update Failed"
+                }
+                self.asr.errorMessage = error.localizedDescription
+                self.asr.showError = true
+            }
+        }
+    }
+
+    var aiEnhancementStep: some View {
+        OnboardingAIEnhancementStepView(
+            setup: self.aiSetup,
+            finalText: Binding(
+                get: { self.asr.finalText },
+                set: { self.asr.finalText = $0 }
+            ),
+            progressValue: self.compactProgressValue,
+            glowCenter: self.landingGlowCenter,
+            shortcutDisplay: self.onboardingShortcutDisplay,
+            isRunning: self.asr.isRunning || self.asr.isStarting,
+            isListening: self.asr.isRunning,
+            isRecordingShortcut: self.isRecordingPrimaryShortcut,
+            onGlowMove: self.updateLandingGlow(location:in:),
+            onGlowExit: self.resetLandingGlow,
+            onBack: self.goBack,
+            onSkip: {
+                let origin = self.settings.analyticsOnboardingOrigin
+                self.markAISkipped()
+                self.finishOnboardingAtGettingStarted()
+                self.completeCurrentStep(
+                    outcome: .skipped,
+                    origin: origin,
+                    completesFlow: self.settings.onboardingCompleted
+                )
+            },
+            onFinishSetup: {
+                let origin = self.settings.analyticsOnboardingOrigin
+                self.finishOnboardingAtGettingStarted()
+                self.completeCurrentStep(
+                    outcome: .completed,
+                    origin: origin,
+                    completesFlow: self.settings.onboardingCompleted
+                )
+            }
+        )
+    }
+
     var orderedOnboardingInputDevices: [AudioDevice.Device] {
         let devicesByUID = Dictionary(
             self.onboardingInputDevices.map { ($0.uid, $0) },
@@ -3044,18 +2529,19 @@ private struct OnboardingMicrophoneSetupPanel: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Text("Select your microphone")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.fluidSystem(size: 12, weight: .semibold))
                     .foregroundStyle(Color.white.opacity(0.58))
 
                 Spacer(minLength: 12)
 
                 if self.devices.isEmpty {
                     Text("No microphone available")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.fluidSystem(size: 12, weight: .semibold))
                         .foregroundStyle(Color.orange.opacity(0.9))
                 } else {
-                    Picker(
+                    FluidDropdownPicker(
                         "Input microphone",
+                        selectedTitle: self.devices.first(where: { $0.uid == self.selectedUID })?.name ?? "Choose microphone",
                         selection: Binding(
                             get: { self.selectedUID },
                             set: self.onSelect
@@ -3066,7 +2552,7 @@ private struct OnboardingMicrophoneSetupPanel: View {
                         }
                     }
                     .labelsHidden()
-                    .pickerStyle(.menu)
+                    .fluidDropdownStyle()
                     .frame(width: 248)
                     .tint(.white)
                     .accessibilityHint("Moves the selected microphone to first in FluidVoice priority")
@@ -3086,7 +2572,7 @@ private struct OnboardingMicrophoneSetupPanel: View {
                     .frame(width: 6, height: 6)
 
                 Text(self.status.text)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.fluidSystem(size: 11, weight: .semibold))
                     .foregroundStyle(self.status.color)
 
                 Spacer()

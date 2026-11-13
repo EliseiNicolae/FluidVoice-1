@@ -1,0 +1,670 @@
+import AppKit
+import ApplicationServices
+import Carbon.HIToolbox
+import ScreenCaptureKit
+import Vision
+
+/// Raw text around a dictation, for models trained to read it.
+/// Fluid Intelligence picks the useful words and writes the prompt lines,
+/// so nothing here formats them.
+nonisolated struct DictationTypingContext: Sendable, Equatable {
+    var textBeforeCursor: String?
+    // One Accessibility element or OCR line per entry; nil means none was read.
+    // swiftlint:disable:next discouraged_optional_collection
+    var screenText: [String]?
+    // The window as Edit Mode reads it; nil for a dictation.
+    // swiftlint:disable:next discouraged_optional_collection
+    var windowLines: [EditModeWindowLine]? = nil
+}
+
+/// A piece of text in the front window and where it is. Stays on this Mac and is
+/// never logged or kept.
+nonisolated struct EditModeWindowLine: Sendable, Equatable {
+    let text: String
+    let x: Int
+    let y: Int
+    let width: Int
+    let height: Int
+}
+
+/// Reads the dictation context when recording starts, off the main thread,
+/// so it is ready when speech ends. What it reads is never logged or kept.
+final nonisolated class DictationContextCapture: @unchecked Sendable {
+    private let target: TypingService.RecordingTargetContext
+    private let task: Task<DictationTypingContext?, Never>
+    private let first = FirstResult()
+
+    init(target: TypingService.RecordingTargetContext, task: Task<DictationTypingContext?, Never>) {
+        self.target = target
+        self.task = task
+    }
+
+    deinit { self.cancel() }
+
+    @MainActor
+    func matches(_ target: TypingService.RecordingTargetContext) -> Bool {
+        guard self.target.pid == target.pid else { return false }
+        if self.target.id == target.id { return true }
+        guard let original = self.target.element, let current = target.element,
+              CFEqual(original, current)
+        else { return false }
+        switch (self.target.window, target.window) {
+        case let (original?, current?): return CFEqual(original, current)
+        case (nil, nil): return true
+        default: return false
+        }
+    }
+
+    @MainActor
+    static func start(
+        target: TypingService.RecordingTargetContext,
+        textBeforeCursor: String?,
+        settings: SettingsStore
+    ) -> DictationContextCapture? {
+        guard settings.dictationScreenContextEnabled, AXIsProcessTrusted() else { return nil }
+        let request = DictationContextReader.Request(
+            pid: target.pid,
+            bundleID: target.bundleIdentifier,
+            window: target.window,
+            element: target.element,
+            textBeforeCursor: textBeforeCursor,
+            isEnabled: settings.dictationScreenContextEnabled
+        )
+        let task = Task.detached(priority: .userInitiated) {
+            await DictationContextReader.read(request)
+        }
+        return DictationContextCapture(target: target, task: task)
+    }
+
+    /// Reads the window for on-device Edit Mode, which has its own setting.
+    @MainActor
+    static func startForEditMode(target: TypingService.RecordingTargetContext) -> DictationContextCapture? {
+        guard AXIsProcessTrusted() else { return nil }
+        let request = DictationContextReader.Request(
+            pid: target.pid,
+            bundleID: target.bundleIdentifier,
+            window: target.window,
+            element: target.element,
+            textBeforeCursor: nil,
+            isEnabled: true
+        )
+        let task = Task.detached(priority: .userInitiated) {
+            await DictationContextReader.readWindowLines(request)
+        }
+        return DictationContextCapture(target: target, task: task)
+    }
+
+    /// The context, or nil when it is not ready within `timeout`; a late
+    /// result is dropped.
+    func result(timeout: Duration) async -> DictationTypingContext? {
+        let task = self.task
+        let first = self.first
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                first.install(continuation)
+                Task.detached {
+                    let value = await task.value
+                    first.resume(task.isCancelled ? nil : value)
+                }
+                first.setTimeout(Task.detached {
+                    do { try await Task.sleep(for: timeout) } catch { return }
+                    task.cancel()
+                    first.resume(nil)
+                })
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func cancel() {
+        self.task.cancel()
+        self.first.resume(nil)
+    }
+}
+
+private final nonisolated class FirstResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<DictationTypingContext?, Never>?
+    private var completed = false
+    private var value: DictationTypingContext?
+    private var timeout: Task<Void, Never>?
+
+    func install(_ continuation: CheckedContinuation<DictationTypingContext?, Never>) {
+        self.lock.lock()
+        if self.completed {
+            let value = self.value
+            self.lock.unlock()
+            continuation.resume(returning: value)
+        } else {
+            self.continuation = continuation
+            self.lock.unlock()
+        }
+    }
+
+    func setTimeout(_ timeout: Task<Void, Never>) {
+        self.lock.lock()
+        let completed = self.completed
+        if !completed { self.timeout = timeout }
+        self.lock.unlock()
+        if completed { timeout.cancel() }
+    }
+
+    func resume(_ value: DictationTypingContext?) {
+        self.lock.lock()
+        guard !self.completed else {
+            self.lock.unlock()
+            return
+        }
+        self.completed = true
+        self.value = value
+        let continuation = self.continuation
+        self.continuation = nil
+        let timeout = self.timeout
+        self.timeout = nil
+        self.lock.unlock()
+        timeout?.cancel()
+        continuation?.resume(returning: value)
+    }
+}
+
+nonisolated enum DictationContextReader {
+    struct Request: @unchecked Sendable {
+        let pid: pid_t
+        let bundleID: String?
+        let window: AXUIElement?
+        let element: AXUIElement?
+        /// Already read for dictation formatting; nil reads it here.
+        let textBeforeCursor: String?
+        let isEnabled: Bool
+    }
+
+    static let maxTextBeforeCursorCharacters = 2000
+    static let maxScreenLines = 300
+    static let maxLineCharacters = 400
+    /// Fewer words than this means Accessibility could not read the window,
+    /// so OCR is tried when it is allowed.
+    static let minimumAccessibilityWords = 25
+
+    private static let maxLinesPerElement = 150
+    private static let maxVisitedElements = 4000
+    private static let accessibilityBudgetSeconds = 0.5
+    private static let messagingTimeoutSeconds: Float = 0.1
+    /// Omit long text values when the app cannot report their visible range.
+    private static let longValueCharacters = 4000
+    /// Edit Mode isn't waiting on the read while the user speaks, so it can look further.
+    private static let windowBudgetSeconds = 1.5
+    private static let maxVisitedWindowElements = 10_000
+    private static let windowReadAttempts = 3
+    private static let windowReadRetryDelay: Duration = .milliseconds(300)
+
+    private static let passwordManagerMarkers = [
+        "password", "1password", "onepassword", "bitwarden", "lastpass", "dashlane",
+        "keepass", "enpass", "keychain", "strongbox", "nordpass", "proton.pass", "keeper",
+    ]
+    private static let skippedRoles: Set<String> = [
+        "AXSecureTextField", "AXScrollBar", "AXValueIndicator", "AXSplitter",
+        "AXGrowArea", "AXIncrementor", "AXMenuBar", "AXMenu",
+    ]
+    /// Roles whose description is their visible label, such as icon buttons.
+    private static let labelledRoles: Set<String> = [
+        "AXButton", "AXLink", "AXImage", "AXMenuButton", "AXPopUpButton",
+        "AXRadioButton", "AXCheckBox", "AXTab",
+    ]
+    private static let textEntryRoles: Set<String> = ["AXTextArea", "AXTextField", "AXComboBox"]
+
+    static func read(
+        _ request: Request,
+        recognizeWindow: @Sendable (pid_t, AXUIElement?) async -> [String] = { await DictationContextReader.recognizedWindowText(pid: $0, window: $1) }
+    ) async -> DictationTypingContext? {
+        guard request.isEnabled, !Task.isCancelled else { return nil }
+        if let element = request.element { AXUIElementSetMessagingTimeout(element, self.messagingTimeoutSeconds) }
+        guard !self.isPrivate(request) else { return nil }
+
+        let textBeforeCursor = (request.textBeforeCursor ?? request.element.flatMap(self.textBeforeCursor(in:)))
+            .map { String($0.suffix(self.maxTextBeforeCursorCharacters)) }
+
+        var lines = LineCollector()
+        let windows = self.windows(for: request)
+        for window in windows where !Task.isCancelled {
+            self.collectAccessibilityText(in: window, into: &lines)
+        }
+        if let window = windows.first,
+           lines.wordCount < self.minimumAccessibilityWords, !Task.isCancelled
+        {
+            for line in await recognizeWindow(request.pid, window) {
+                lines.add(line)
+            }
+        }
+        guard !Task.isCancelled else { return nil }
+
+        let context = DictationTypingContext(
+            textBeforeCursor: textBeforeCursor?.isEmpty == false ? textBeforeCursor : nil,
+            screenText: lines.lines.isEmpty ? nil : lines.lines
+        )
+        return context.textBeforeCursor == nil && context.screenText == nil ? nil : context
+    }
+
+    /// The whole window for Edit Mode, with positions. A dictation only wants rare
+    /// words; this keeps numbers, repeats and long paragraphs, because the answer
+    /// comes from them.
+    static func readWindowLines(
+        _ request: Request,
+        recognizeWindow: @Sendable (pid_t, AXUIElement?) async -> [EditModeWindowLine] = { await DictationContextReader.recognizedWindowLines(pid: $0, window: $1) }
+    ) async -> DictationTypingContext? {
+        guard request.isEnabled, !Task.isCancelled else { return nil }
+        if let element = request.element { AXUIElementSetMessagingTimeout(element, self.messagingTimeoutSeconds) }
+        guard !self.isPrivate(request) else { return nil }
+        let isFirstLook = !self.hasAskedForWebContent(pid: request.pid)
+        guard let window = self.windows(for: request).first else { return nil }
+
+        // Web content builds its Accessibility tree only once asked, and the app's
+        // own toolbars can hide that the page is still missing, so a first look
+        // always takes a few reads.
+        var lines = EditModeWindowLines()
+        for attempt in 0..<self.windowReadAttempts where isFirstLook || lines.wordCount < self.minimumAccessibilityWords {
+            if attempt > 0 { try? await Task.sleep(for: self.windowReadRetryDelay) }
+            guard !Task.isCancelled else { return nil }
+            var fresh = EditModeWindowLines()
+            self.collectWindowLines(in: window, into: &fresh)
+            if fresh.wordCount >= lines.wordCount { lines = fresh }
+        }
+        var read = lines.lines
+        if lines.wordCount < self.minimumAccessibilityWords {
+            let recognized = await recognizeWindow(request.pid, window)
+            if !recognized.isEmpty { read = recognized }
+        }
+        guard !Task.isCancelled, !read.isEmpty else { return nil }
+        return DictationTypingContext(textBeforeCursor: nil, screenText: nil, windowLines: read)
+    }
+
+    private static func windows(for request: Request) -> [AXUIElement] {
+        guard let window = request.window else { return [] }
+        let app = AXUIElementCreateApplication(request.pid)
+        self.exposeWebContent(of: app, pid: request.pid)
+        return [window]
+    }
+
+    private static let webContentLock = NSLock()
+    private nonisolated(unsafe) static var webContentPIDs: [pid_t] = []
+
+    private static func hasAskedForWebContent(pid: pid_t) -> Bool {
+        self.webContentLock.withLock { self.webContentPIDs.contains(pid) }
+    }
+
+    /// Chrome and Electron apps build their page's Accessibility tree only
+    /// when asked; other apps ignore the attribute. The tree may still be
+    /// building on the first dictation in such an app.
+    private static func exposeWebContent(of app: AXUIElement, pid: pid_t) {
+        self.webContentLock.lock()
+        let isNew = !self.webContentPIDs.contains(pid)
+        if isNew {
+            if self.webContentPIDs.count == 64 { self.webContentPIDs.removeFirst() }
+            self.webContentPIDs.append(pid)
+        }
+        self.webContentLock.unlock()
+        guard isNew else { return }
+        AXUIElementSetMessagingTimeout(app, self.messagingTimeoutSeconds)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+
+    // MARK: - Privacy
+
+    private static func isPrivate(_ request: Request) -> Bool {
+        if IsSecureEventInputEnabled() { return true }
+        if let bundleID = request.bundleID?.lowercased(),
+           self.passwordManagerMarkers.contains(where: { bundleID.contains($0) })
+        {
+            return true
+        }
+        return request.element.map(self.isSecure) ?? false
+    }
+
+    private static func isSecure(_ element: AXUIElement) -> Bool {
+        let role = self.string(element, kAXRoleAttribute) ?? ""
+        let subrole = self.string(element, kAXSubroleAttribute) ?? ""
+        return role == "AXSecureTextField"
+            || subrole == (kAXSecureTextFieldSubrole as String)
+            || subrole.localizedCaseInsensitiveContains("secure")
+    }
+
+    // MARK: - Text before the cursor
+
+    private static func textBeforeCursor(in element: AXUIElement) -> String? {
+        guard let selection = self.range(element, kAXSelectedTextRangeAttribute) else { return nil }
+        let end = selection.location
+        guard end > 0 else { return nil }
+        let start = max(0, end - self.maxTextBeforeCursorCharacters)
+        if let text = self.string(element, in: CFRange(location: start, length: end - start)) {
+            return text
+        }
+        guard let value = self.string(element, kAXValueAttribute) else { return nil }
+        let nsValue = value as NSString
+        let safeEnd = min(end, nsValue.length)
+        let safeStart = max(0, safeEnd - self.maxTextBeforeCursorCharacters)
+        return nsValue.substring(with: NSRange(location: safeStart, length: safeEnd - safeStart))
+    }
+
+    // MARK: - Accessibility text
+
+    private struct ElementText {
+        let role: String
+        let isSecure: Bool
+        let texts: [String]
+        let frame: CGRect?
+        let children: [AXUIElement]
+    }
+
+    private static let fetchedAttributes = [
+        kAXRoleAttribute, kAXSubroleAttribute, kAXValueAttribute, kAXTitleAttribute,
+        kAXDescriptionAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXChildrenAttribute,
+        kAXVisibleCharacterRangeAttribute,
+    ] as CFArray
+
+    private static func collectAccessibilityText(in window: AXUIElement, into lines: inout LineCollector) {
+        let deadline = ProcessInfo.processInfo.systemUptime + self.accessibilityBudgetSeconds
+        AXUIElementSetMessagingTimeout(window, self.messagingTimeoutSeconds)
+        let windowFrame = self.frame(of: window)
+        var stack = [window]
+        var visited = 0
+        while let element = stack.popLast(), visited < self.maxVisitedElements, !lines.isFull {
+            visited += 1
+            if Task.isCancelled || ProcessInfo.processInfo.systemUptime > deadline {
+                break
+            }
+            AXUIElementSetMessagingTimeout(element, self.messagingTimeoutSeconds)
+            guard let item = self.elementText(element),
+                  !item.isSecure, !self.skippedRoles.contains(item.role)
+            else { continue }
+            // Scrolled-out content lies outside the window; it is not on screen.
+            if let windowFrame, let frame = item.frame, !frame.isEmpty, !frame.intersects(windowFrame) {
+                continue
+            }
+            for text in item.texts {
+                lines.add(text, limit: self.maxLinesPerElement)
+            }
+            stack.append(contentsOf: item.children.prefix(max(0, self.maxVisitedElements - visited - stack.count)).reversed())
+        }
+    }
+
+    private static func collectWindowLines(in window: AXUIElement, into lines: inout EditModeWindowLines) {
+        let deadline = ProcessInfo.processInfo.systemUptime + self.windowBudgetSeconds
+        AXUIElementSetMessagingTimeout(window, self.messagingTimeoutSeconds)
+        let windowFrame = self.frame(of: window)
+        var stack = [window]
+        var visited = 0
+        while let element = stack.popLast(), visited < self.maxVisitedWindowElements, !lines.isFull {
+            visited += 1
+            if Task.isCancelled || ProcessInfo.processInfo.systemUptime > deadline {
+                break
+            }
+            AXUIElementSetMessagingTimeout(element, self.messagingTimeoutSeconds)
+            guard let item = self.elementText(element),
+                  !item.isSecure, !self.skippedRoles.contains(item.role)
+            else { continue }
+            if let windowFrame, let frame = item.frame, !frame.isEmpty, !frame.intersects(windowFrame) {
+                continue
+            }
+            // Without a position the text can't be placed, and it is rarely on screen.
+            if let frame = item.frame, !frame.isEmpty {
+                for text in item.texts {
+                    lines.add(text, frame: frame)
+                }
+            }
+            stack.append(contentsOf: item.children.prefix(max(0, self.maxVisitedWindowElements - visited - stack.count)).reversed())
+        }
+    }
+
+    private static func elementText(_ element: AXUIElement) -> ElementText? {
+        var valuesRef: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(element, self.fetchedAttributes, AXCopyMultipleAttributeOptions(), &valuesRef) == .success,
+              let values = valuesRef as? [AnyObject], values.count == 9
+        else { return nil }
+
+        let role = values[0] as? String ?? ""
+        let subrole = values[1] as? String ?? ""
+        var texts: [String] = []
+        if var value = values[2] as? String {
+            if self.textEntryRoles.contains(role) {
+                value = self.textEntryValue(value, visibleRange: self.axValue(values[8], as: CFRange.self, type: .cfRange))
+            }
+            texts.append(value)
+        }
+        if let title = values[3] as? String { texts.append(title) }
+        if self.labelledRoles.contains(role), let description = values[4] as? String { texts.append(description) }
+
+        var frame: CGRect?
+        if let origin = self.axValue(values[5], as: CGPoint.self, type: .cgPoint),
+           let size = self.axValue(values[6], as: CGSize.self, type: .cgSize)
+        {
+            frame = CGRect(origin: origin, size: size)
+        }
+        return ElementText(
+            role: role,
+            isSecure: role == "AXSecureTextField" || subrole == (kAXSecureTextFieldSubrole as String),
+            texts: texts,
+            frame: frame,
+            children: values[7] as? [AXUIElement] ?? []
+        )
+    }
+
+    /// Use the app's visible range even for short fields that may be scrolled.
+    /// Read both attributes together and slice the value without another AX call.
+    static func textEntryValue(_ value: String, visibleRange: CFRange?) -> String {
+        let text = value as NSString
+        guard let visibleRange else { return text.length <= self.longValueCharacters ? value : "" }
+        guard visibleRange.location >= 0, visibleRange.length > 0,
+              visibleRange.location <= text.length,
+              visibleRange.length <= text.length - visibleRange.location
+        else { return "" }
+        return text.substring(with: NSRange(location: visibleRange.location, length: visibleRange.length))
+    }
+
+    // MARK: - OCR fallback
+
+    /// Screenshots only the dictated-into window, at native Retina pixels
+    /// (Vision garbles small gray text at 1x), and reads it with Vision.
+    /// Needs Screen Recording; FluidVoice never asks for it here.
+    private static func recognizedWindowText(pid: pid_t, window: AXUIElement?) async -> [String] {
+        guard let image = await self.windowImage(pid: pid, window: window) else { return [] }
+        return self.recognizedText(in: image).compactMap { $0.topCandidates(1).first?.string }
+    }
+
+    /// The same read as `recognizedWindowText`, keeping where each line is.
+    private static func recognizedWindowLines(pid: pid_t, window: AXUIElement?) async -> [EditModeWindowLine] {
+        guard let image = await self.windowImage(pid: pid, window: window) else { return [] }
+        return self.recognizedText(in: image).compactMap { observation in
+            guard let text = observation.topCandidates(1).first?.string else { return nil }
+            let box = VNImageRectForNormalizedRect(observation.boundingBox, image.width, image.height)
+            // Vision counts from the bottom of the image, screen text from the top.
+            return EditModeWindowLine(
+                text: text,
+                x: Int(box.minX),
+                y: image.height - Int(box.maxY),
+                width: Int(box.width),
+                height: Int(box.height)
+            )
+        }
+    }
+
+    private static func windowImage(pid: pid_t, window: AXUIElement?) async -> CGImage? {
+        guard !Task.isCancelled, CGPreflightScreenCaptureAccess(),
+              let frame = window.flatMap(self.frame(of:)),
+              let windowID = self.windowID(pid: pid, frame: frame)
+        else { return nil }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard !Task.isCancelled,
+                  let scWindow = content.windows.first(where: { $0.windowID == windowID })
+            else { return nil }
+            let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            let configuration = SCStreamConfiguration()
+            let scale = CGFloat(filter.pointPixelScale)
+            configuration.width = Int((filter.contentRect.width * scale).rounded())
+            configuration.height = Int((filter.contentRect.height * scale).rounded())
+            configuration.captureResolution = .best
+            configuration.showsCursor = false
+            configuration.ignoreShadowsSingleWindow = true
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            return Task.isCancelled ? nil : image
+        } catch {
+            return nil
+        }
+    }
+
+    private static func recognizedText(in image: CGImage) -> [VNRecognizedTextObservation] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["en-US"]
+        do {
+            try VNImageRequestHandler(cgImage: image).perform([request])
+        } catch {
+            return []
+        }
+        return request.results ?? []
+    }
+
+    /// Only the captured window may be read; a stale window must never fall back to another one.
+    private static func windowID(pid: pid_t, frame: CGRect?) -> CGWindowID? {
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        return self.windowID(pid: pid, frame: frame, windows: info)
+    }
+
+    static func windowID(pid: pid_t, frame: CGRect?, windows: [[String: Any]]) -> CGWindowID? {
+        guard let frame, !frame.isEmpty else { return nil }
+        var matching: CGWindowID?
+        for window in windows {
+            guard (window[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  (window[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  abs(rect.minX - frame.minX) < 2, abs(rect.minY - frame.minY) < 2,
+                  abs(rect.width - frame.width) < 2, abs(rect.height - frame.height) < 2
+            else { continue }
+            // Same-sized windows cannot be distinguished by bounds. Never
+            // guess from their stacking order, which can change during a read.
+            guard matching == nil, let windowID = window[kCGWindowNumber as String] as? CGWindowID else { return nil }
+            matching = windowID
+        }
+        return matching
+    }
+
+    // MARK: - Accessibility helpers
+
+    private static func element(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private static func string(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    private static func string(_ element: AXUIElement, in range: CFRange) -> String? {
+        var range = range
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &value
+        ) == .success else { return nil }
+        return value as? String
+    }
+
+    private static func range(_ element: AXUIElement, _ attribute: String) -> CFRange? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return self.axValue(value, as: CFRange.self, type: .cfRange)
+    }
+
+    private static func frame(of element: AXUIElement) -> CGRect? {
+        var position: CFTypeRef?
+        var size: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size) == .success,
+              let origin = self.axValue(position, as: CGPoint.self, type: .cgPoint),
+              let extent = self.axValue(size, as: CGSize.self, type: .cgSize)
+        else { return nil }
+        return CGRect(origin: origin, size: extent)
+    }
+
+    private static func axValue<T>(_ value: CFTypeRef?, as _: T.Type, type: AXValueType) -> T? {
+        guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeBitCast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == type else { return nil }
+        let pointer = UnsafeMutablePointer<T>.allocate(capacity: 1)
+        defer { pointer.deallocate() }
+        guard AXValueGetValue(axValue, type, pointer) else { return nil }
+        return pointer.pointee
+    }
+}
+
+/// Window text with positions, within size caps well above what the model can
+/// read: Fluid Intelligence lays it out and shortens it to fit. A link and the text
+/// inside it report the same words, so a repeat only counts where it overlaps.
+nonisolated struct EditModeWindowLines {
+    static let maxLines = 1500
+    static let maxCharacters = 60_000
+    static let maxLineCharacters = 4000
+    /// A container's title sits at its top, not in the middle of its contents.
+    static let maxRowHeight: CGFloat = 40
+
+    private(set) var lines: [EditModeWindowLine] = []
+    private(set) var wordCount = 0
+    private var characterCount = 0
+    private var placed: [String: [CGRect]] = [:]
+
+    var isFull: Bool { self.lines.count >= Self.maxLines || self.characterCount >= Self.maxCharacters }
+
+    mutating func add(_ text: String, frame: CGRect) {
+        let rows = text.split(whereSeparator: \.isNewline)
+            .map { String($0.trimmingCharacters(in: .whitespaces).prefix(Self.maxLineCharacters)) }
+            .filter { $0.contains { $0.isLetter || $0.isNumber } }
+        guard !rows.isEmpty else { return }
+        let rowHeight = min(frame.height / CGFloat(rows.count), Self.maxRowHeight)
+        for (index, row) in rows.enumerated() where !self.isFull {
+            let rect = CGRect(x: frame.minX, y: frame.minY + CGFloat(index) * rowHeight, width: frame.width, height: rowHeight)
+            guard !(self.placed[row]?.contains { $0.intersects(rect) } ?? false) else { continue }
+            self.placed[row, default: []].append(rect)
+            self.lines.append(EditModeWindowLine(
+                text: row,
+                x: Int(rect.minX),
+                y: Int(rect.minY),
+                width: Int(rect.width),
+                height: max(Int(rect.height), 1)
+            ))
+            self.wordCount += row.split(whereSeparator: \.isWhitespace).count
+            self.characterCount += row.count
+        }
+    }
+}
+
+/// Screen lines in reading order, without repeats, within the size caps.
+private nonisolated struct LineCollector {
+    private(set) var lines: [String] = []
+    private(set) var wordCount = 0
+    private var seen: Set<String> = []
+
+    var isFull: Bool { self.lines.count >= DictationContextReader.maxScreenLines }
+
+    mutating func add(_ text: String, limit: Int = .max) {
+        var added = 0
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            guard !self.isFull, added < limit else { return }
+            let line = String(rawLine.trimmingCharacters(in: .whitespaces).prefix(DictationContextReader.maxLineCharacters))
+            guard line.contains(where: \.isLetter), self.seen.insert(line).inserted else { continue }
+            self.lines.append(line)
+            self.wordCount += line.split(whereSeparator: \.isWhitespace).count
+            added += 1
+        }
+    }
+}

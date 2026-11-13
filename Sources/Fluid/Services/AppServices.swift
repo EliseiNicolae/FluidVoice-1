@@ -31,13 +31,17 @@ final class AppServices: ObservableObject {
     /// Flag indicating the UI has completed its initial render.
     /// Heavy operations should wait until this is true.
     @Published private(set) var isUIReady: Bool = false
+    @Published private(set) var meetingAutoDetectHealth: MeetingAutoDetector.Health?
+    @Published private(set) var meetingAutomaticTarget: MeetingAutoDetector.ResolvedTarget?
 
     /// Call this once the main UI has finished its initial layout.
     /// This signals that it's safe to start heavy services.
     func signalUIReady() {
-        guard !self.isUIReady else { return }
-        DebugLogger.shared.info("🚦 UI Ready signal received - services can now initialize", source: "AppServices")
-        self.isUIReady = true
+        if !self.isUIReady {
+            DebugLogger.shared.info("🚦 UI Ready signal received - services can now initialize", source: "AppServices")
+            self.isUIReady = true
+        }
+        self.refreshFluidMeetAvailability()
     }
 
     // MARK: - Lazy Services
@@ -68,6 +72,16 @@ final class AppServices: ObservableObject {
         return service
     }
 
+    private var _fileTranscriptionService: FileTranscriptionService?
+    var fileTranscriptionService: FileTranscriptionService {
+        if let existing = self._fileTranscriptionService {
+            return existing
+        }
+        let service = FileTranscriptionService(asrService: self.asr)
+        self._fileTranscriptionService = service
+        return service
+    }
+
     private var _microphonePreferenceCoordinator: MicrophonePreferenceCoordinator?
     var microphonePreferenceCoordinator: MicrophonePreferenceCoordinator {
         if let existing = self._microphonePreferenceCoordinator {
@@ -78,14 +92,341 @@ final class AppServices: ObservableObject {
         return coordinator
     }
 
+    private var _meetingAudioActivityArbiter: AudioActivityArbiter?
+    var meetingAudioActivityArbiter: AudioActivityArbiter {
+        if let existing = self._meetingAudioActivityArbiter {
+            return existing
+        }
+        let arbiter = AudioActivityArbiter { [weak self] in
+            guard let self else { throw MeetingCoordinatorError.activityInProgress }
+            return self.asr as any ASRActivityLeasing
+        }
+        self._meetingAudioActivityArbiter = arbiter
+        return arbiter
+    }
+
+    private var _meetingSessionCoordinator: MeetingSessionCoordinator?
+    var meetingSessionCoordinator: MeetingSessionCoordinator {
+        if let existing = self._meetingSessionCoordinator {
+            return existing
+        }
+        DebugLogger.shared.info("Lazily creating MeetingSessionCoordinator", source: "AppServices")
+        let coordinator = MeetingSessionCoordinator(
+            store: MeetingSessionStore.shared,
+            capture: MeetingCaptureEngine(),
+            processing: MeetingProcessingPipeline(
+                asrServiceProvider: { AppServices.shared.asr },
+                prepareDiarizationModel: { try await MeetingDiarizationModelStore.shared.ensureInstalled() }
+            ),
+            audioArbiter: self.meetingAudioActivityArbiter,
+            preferredMicrophoneUID: { [weak self] in
+                self?.microphonePreferenceCoordinator.inputDeviceForCapture()?.uid
+            },
+            // The speaker model is only needed after Stop, so a missing model never blocks
+            // recording; final processing waits for `MeetingDiarizationModelStore` instead.
+            validateRecordingModels: {
+                guard CPUArchitecture.isAppleSilicon else {
+                    throw MeetingParakeetNemotronRuntimeError.unsupportedArchitecture
+                }
+            }
+        )
+        self._meetingSessionCoordinator = coordinator
+        self.setupMeetingCoordinatorForwarding()
+        // Attach end monitoring to every captured call, including manual and menu-bar starts.
+        // Start-prompt episodes remain consumed until the meeting's own evidence ends.
+        coordinator.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak coordinator] _ in
+                // Deliveries are queued, so read the state as it is now before calling a recording over.
+                Self.synchronizeMeetingEndWatch(
+                    state: coordinator?.state,
+                    session: coordinator?.activeSession,
+                    detector: self?._meetingAutoDetector
+                )
+                if let currentState = coordinator?.state, MeetingOverlayVisibility.isVisible(for: currentState) {
+                    MeetingRecordingSourcePromptController.shared.recordingDidStart()
+                }
+                MeetingStillRecordingNudgeController.shared.synchronizeRecording(
+                    sessionID: Self.recordingSessionID(state: coordinator?.state, session: coordinator?.activeSession)
+                )
+            }
+            .store(in: &self.cancellables)
+        Task { @MainActor in
+            guard SettingsStore.shared.fluidMeetEnabled else { return }
+            MeetingRecordingPillController.shared.activate(coordinator: coordinator)
+            await coordinator.ensureRestored()
+            guard SettingsStore.shared.fluidMeetEnabled else { return }
+            await coordinator.sweepExpiredAudio()
+        }
+        return coordinator
+    }
+
+    /// Standalone — activated once, independently of `meetingSessionCoordinator`'s lazy getter.
+    private var _meetingAutoDetector: MeetingAutoDetector?
+    var meetingAutoDetector: MeetingAutoDetector {
+        if let existing = self._meetingAutoDetector {
+            return existing
+        }
+        let detector = MeetingAutoDetector(
+            workspaceEvents: WorkspaceEventsMonitor(),
+            micActivity: CoreAudioMicActivitySignal(),
+            audioProcessActivity: CoreAudioProcessActivityProvider(),
+            windowSnapshotProvider: CGWindowSnapshotProvider(),
+            browserTabReader: AXBrowserTabReader(),
+            activityGate: LiveDetectionActivityGate(),
+            clock: SystemClock(),
+            isNativeDetectionEnabled: { SettingsStore.shared.fluidMeetEnabled && SettingsStore.shared.meetingAutoDetectEnabled },
+            isBrowserDetectionEnabled: {
+                SettingsStore.shared.fluidMeetEnabled && SettingsStore.shared.meetingAutoDetectEnabled && SettingsStore.shared.meetingAutoDetectBrowserEnabled
+            },
+            lastSpeechAt: { [weak self] in self?._meetingSessionCoordinator?.lastLiveSpeechAt }
+        )
+        self._meetingAutoDetector = detector
+        self.wireMeetingAutoDetector(detector)
+        if SettingsStore.shared.fluidMeetEnabled { detector.start() }
+        DebugLogger.shared.info("detector-started", source: "MeetingAutoDetector")
+        return detector
+    }
+
+    private func wireMeetingAutoDetector(_ detector: MeetingAutoDetector) {
+        // The detector is lazy; a manual recording may already be running when it is created.
+        Self.synchronizeMeetingEndWatch(
+            state: self._meetingSessionCoordinator?.state,
+            session: self._meetingSessionCoordinator?.activeSession,
+            detector: detector
+        )
+        detector.onAutomaticTargetChanged = { [weak self, weak detector] target in
+            self?.meetingAutomaticTarget = target
+            // A cleared target may be detector teardown; never re-arm a watch from it.
+            guard target != nil else { return }
+            Self.synchronizeMeetingEndWatch(
+                state: self?._meetingSessionCoordinator?.state,
+                session: self?._meetingSessionCoordinator?.activeSession,
+                detector: detector
+            )
+        }
+        detector.onPromptRequested = { [weak detector] request in
+            guard !MeetingRecordingSourcePromptController.shared.isPresented else {
+                detector?.timeoutDismissed(episodeID: request.episodeID)
+                return
+            }
+            MeetingDetectionPromptController.shared.present(request)
+        }
+        detector.onHealthChanged = { [weak self] health in
+            self?.meetingAutoDetectHealth = health
+        }
+        detector.onStillRecordingNudge = { [weak self, weak detector] in
+            guard let self, let sessionID = detector?.pendingEndConfirmationSessionID,
+                  self.canStopMeetingAfterEndConfirmation(sessionID: sessionID)
+            else { return }
+            MeetingStillRecordingNudgeController.shared.present(sessionID: sessionID)
+        }
+        detector.onStillRecordingNudgeWithdrawn = {
+            MeetingStillRecordingNudgeController.shared.hide()
+        }
+        detector.onSuggestDisablingAutoDetect = {
+            MeetingAutoDetectDismissalAdvisor.shared.shouldSuggest = true
+        }
+        detector.onEpisodeInvalidated = { episodeID in
+            MeetingDetectionPromptController.shared.invalidateEpisode(episodeID)
+        }
+        MeetingDetectionPromptController.shared.onStart = { [weak self] episodeID in
+            guard let self else { throw MeetingAutoDetector.StartError.cannotStart }
+            try await self.startAutoDetectedRecording(episodeID: episodeID)
+        }
+        MeetingDetectionPromptController.shared.onSetup = { [weak self] episodeID in
+            // Setup is intentionally navigation-only: it must never materialize a recording.
+            self?._meetingAutoDetector?.timeoutDismissed(episodeID: episodeID)
+            AppNavigationRouter.shared.request(.meetingTranscription)
+        }
+        MeetingDetectionPromptController.shared.onDismiss = { [weak self] episodeID in
+            self?._meetingAutoDetector?.dismissTapped(episodeID: episodeID, at: Date())
+        }
+        MeetingDetectionPromptController.shared.onTimeout = { [weak self] episodeID in
+            self?._meetingAutoDetector?.timeoutDismissed(episodeID: episodeID)
+        }
+        MeetingStillRecordingNudgeController.shared.onDismiss = { [weak self] sessionID in
+            self?._meetingAutoDetector?.stillRecordingNudgeDismissed(sessionID: sessionID)
+        }
+        MeetingStillRecordingNudgeController.shared.shouldContinueCountdown = { [weak self] sessionID in
+            self?.canStopMeetingAfterEndConfirmation(sessionID: sessionID) == true
+        }
+        MeetingStillRecordingNudgeController.shared.onStop = { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                await self?.stopMeetingAfterEndConfirmation(sessionID: sessionID)
+            }
+        }
+    }
+
+    static func recordingSessionID(state: MeetingCoordinatorState?, session: MeetingSession?) -> MeetingSessionID? {
+        guard let session, session.mode.capturesComputerAudio else { return nil }
+        switch state {
+        case let .recording(id), let .recordingDegraded(id):
+            return id == session.id ? id : nil
+        default:
+            return nil
+        }
+    }
+
+    private func canStopMeetingAfterEndConfirmation(sessionID: MeetingSessionID) -> Bool {
+        guard SettingsStore.shared.fluidMeetEnabled,
+              Self.recordingSessionID(state: self._meetingSessionCoordinator?.state, session: self._meetingSessionCoordinator?.activeSession) == sessionID
+        else { return false }
+        return self._meetingAutoDetector?.canStopAfterEndConfirmation(sessionID: sessionID) == true
+    }
+
+    private func stopMeetingAfterEndConfirmation(sessionID: MeetingSessionID) async {
+        guard self.canStopMeetingAfterEndConfirmation(sessionID: sessionID),
+              let coordinator = self._meetingSessionCoordinator
+        else { return }
+        do {
+            _ = try await coordinator.stopAndTranscribe()
+        } catch {
+            // Capture/processing failures publish the coordinator's existing recovery state.
+            DebugLogger.shared.error("Could not finish meeting: \(error.localizedDescription)", source: "MeetingAutoDetector")
+        }
+    }
+
+    /// Watch one positively detected call without narrowing the audio being recorded.
+    /// The detector retains this association for the session even if the target changes.
+    static func meetingEndWatchApplication(
+        session: MeetingSession,
+        target: MeetingAutoDetector.ResolvedTarget?
+    ) -> MeetingApplicationIdentity? {
+        guard session.mode.capturesComputerAudio else { return nil }
+        if session.mode == .onlineCall, session.capturedApplication?.capturesAllInstances != true {
+            return session.capturedApplication
+        }
+        guard let target,
+              session.mode == .systemAudio || session.capturedApplication?.bundleIdentifier == target.bundleIdentifier
+        else { return nil }
+        return MeetingApplicationIdentity(
+            bundleIdentifier: target.bundleIdentifier,
+            processID: target.pid,
+            displayName: session.capturedApplication?.displayName ?? target.bundleIdentifier
+        )
+    }
+
+    /// Inputs must be the coordinator's current snapshot, not a queued state notification.
+    static func synchronizeMeetingEndWatch(
+        state: MeetingCoordinatorState?,
+        session: MeetingSession?,
+        detector: MeetingAutoDetector?
+    ) {
+        guard let detector else { return }
+        switch state {
+        case .preparing:
+            break
+        case let .recording(id), let .recordingDegraded(id):
+            guard let session, session.id == id else {
+                detector.recordingStopped()
+                return
+            }
+            let application = Self.meetingEndWatchApplication(session: session, target: detector.automaticTarget)
+            if application == nil,
+               session.mode == .systemAudio || (session.mode == .onlineCall && session.capturedApplication?.capturesAllInstances == true)
+            {
+                detector.awaitDetectedCall(
+                    sessionID: id,
+                    applicationBundleIdentifier: session.mode == .systemAudio ? nil : session.capturedApplication?.bundleIdentifier
+                )
+            } else {
+                detector.recordingStarted(sessionID: id, application: application)
+            }
+        default:
+            detector.recordingStopped()
+        }
+    }
+
+    private func startAutoDetectedRecording(episodeID: UUID) async throws {
+        guard SettingsStore.shared.fluidMeetEnabled,
+              let detector = self._meetingAutoDetector,
+              let target = detector.resolvedTarget(for: episodeID),
+              detector.canStart(episodeID: episodeID)
+        else {
+            throw MeetingAutoDetector.StartError.cannotStart
+        }
+        let coordinator = self.meetingSessionCoordinator
+        let configuration = try await coordinator.defaultConfiguration(
+            mode: .onlineCall,
+            title: MeetingTranscriptionSetupDraft.defaultTitle(mode: .onlineCall, applicationDisplayName: nil),
+            preferredBundleIdentifier: target.bundleIdentifier,
+            preferredWindowID: target.windowID,
+            preferredProcessID: target.pid,
+            requirePreferredApplication: true
+        )
+        try Task.checkCancellation()
+        guard detector.canStart(episodeID: episodeID) else {
+            throw MeetingAutoDetector.StartError.cannotStart
+        }
+        _ = try await coordinator.startRecording(configuration: configuration)
+        detector.adoptStartedEpisode(episodeID: episodeID)
+        AppNavigationRouter.shared.request(.meetingTranscription)
+    }
+
+    /// Read-only meeting check that does not initialize the meeting stack.
+    var hasActiveMeetingSessionActivity: Bool {
+        guard let coordinator = self._meetingSessionCoordinator else { return false }
+        if coordinator.hasPendingStart { return true }
+        switch coordinator.state {
+        case .preparing, .recording, .recordingDegraded, .stopping, .processing:
+            return true
+        case .idle, .completed, .interrupted, .failed:
+            return false
+        }
+    }
+
+    var hasActiveFileTranscriptionActivity: Bool {
+        self._asr?.activeExclusiveActivity == .fileTranscription
+    }
+
+    /// Read-only checks for MeetingAutoDetector: never force either lazy service into existence.
+    var isMeetingSessionCoordinatorMaterialized: Bool { self._meetingSessionCoordinator != nil }
+    var activeExclusiveActivityIfASRMaterialized: ASRExclusiveActivity? { self._asr?.activeExclusiveActivity }
+
+    /// Legacy UI guard; ASRService is the atomic source of truth for acquisition.
+    var hasActiveMeetingActivity: Bool {
+        self.hasActiveMeetingSessionActivity || self._asr?.activeExclusiveActivity == .meeting
+    }
+
     private var cancellables = Set<AnyCancellable>()
 
     private init() {
+        NotificationCenter.default.publisher(for: .fluidMeetEnabledChanged)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshFluidMeetAvailability() }
+            }
+            .store(in: &self.cancellables)
         // CRITICAL: Services are NOT created here.
         // They are created lazily on first access, which happens AFTER the UI is ready.
         // This ensures SwiftUI's AttributeGraph has finished processing before
         // any heavy audio system work begins.
         DebugLogger.shared.info("📦 AppServices singleton created (services not yet initialized)", source: "AppServices")
+    }
+
+    /// Do not abandon an active recording or processing job when changing availability.
+    func setFluidMeetEnabled(_ enabled: Bool) {
+        guard enabled || !self.hasActiveMeetingSessionActivity else { return }
+        SettingsStore.shared.fluidMeetEnabled = enabled
+    }
+
+    private func refreshFluidMeetAvailability() {
+        guard SettingsStore.shared.fluidMeetEnabled else {
+            self._meetingAutoDetector?.stop()
+            self._meetingAutoDetector = nil
+            self.meetingAutomaticTarget = nil
+            self.meetingAutoDetectHealth = nil
+            MeetingDetectionPromptController.shared.cancelForFeatureDisable()
+            MeetingRecordingSourcePromptController.shared.cancel()
+            MeetingStillRecordingNudgeController.shared.hide()
+            MeetingRecordingPillController.shared.deactivate()
+            return
+        }
+        guard self.isUIReady else { return }
+        if let coordinator = self._meetingSessionCoordinator {
+            MeetingRecordingPillController.shared.activate(coordinator: coordinator)
+        }
+        _ = self.meetingAutoDetector
     }
 
     // MARK: - Change Forwarding
@@ -102,6 +443,16 @@ final class AppServices: ObservableObject {
     private func setupASRForwarding() {
         guard let asr = _asr else { return }
         asr.objectWillChange
+            .sink { [weak self, weak asr] _ in
+                guard asr?.defersStopUIInvalidation == false else { return }
+                self?.objectWillChange.send()
+            }
+            .store(in: &self.cancellables)
+    }
+
+    private func setupMeetingCoordinatorForwarding() {
+        guard let coordinator = self._meetingSessionCoordinator else { return }
+        coordinator.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &self.cancellables)
     }
@@ -120,11 +471,19 @@ final class AppServices: ObservableObject {
         // Access the properties to trigger lazy initialization
         _ = self.audioObserver
         _ = self.asr
+        self.refreshFluidMeetAvailability()
 
         DebugLogger.shared.info("✅ All services initialized", source: "AppServices")
     }
 
     func shutdownForTermination() async {
+        MeetingRecordingSourcePromptController.shared.cancel()
+        self._meetingAutoDetector?.stop()
+        self._meetingAutoDetector = nil
+        if let meetingSessionCoordinator = self._meetingSessionCoordinator {
+            await meetingSessionCoordinator.shutdownForTermination()
+            self._meetingSessionCoordinator = nil
+        }
         if let asr = self._asr {
             await asr.shutdownForTermination()
             self._asr = nil

@@ -3,6 +3,8 @@ import Foundation
 enum AppNavigationDestination {
     case aiEnhancements
     case history
+    case dictationShortcuts
+    case meetingTranscription
 }
 
 @MainActor

@@ -3,6 +3,15 @@ import Foundation
 
 /// Shared gating logic for whether dictation AI post-processing is usable/configured.
 enum DictationAIPostProcessingGate {
+    /// Setup checks the explicit FI choice, not whether a foreground app has a rule.
+    static func isOnboardingChoiceConfigured() -> Bool {
+        let settings = SettingsStore.shared
+        if settings.dictationPromptSelection(for: .primary) == .privateAI {
+            return self.isPrivateProviderConfigured(settings: settings)
+        }
+        return self.isConfigured(for: .primary)
+    }
+
     /// Returns true if dictation AI post-processing should be allowed, given current settings.
     /// - Requires dictation prompt selection to not be `Off`
     /// - Requires the selected provider connection to still be verified
@@ -12,30 +21,17 @@ enum DictationAIPostProcessingGate {
 
     static func isConfigured(for slot: SettingsStore.DictationShortcutSlot, appBundleID: String? = nil) -> Bool {
         let settings = SettingsStore.shared
-        let promptSelection = settings.dictationPromptSelection(for: slot)
+        let promptSelection = settings.resolvedDictationPromptSelection(for: slot, appBundleID: appBundleID)
         guard promptSelection != .off else { return false }
-        if let appBundleID,
-           settings.promptRoutingScope(for: .dictate) == .selectedAppsOnly,
-           !settings.hasAppPromptBinding(for: .dictate, appBundleID: appBundleID)
-        {
-            return false
-        }
-
-        if promptSelection == .privateAI {
-            let route = DictationProviderRoute.resolve(
-                settings: settings,
-                dictationSlot: slot,
-                appBundleID: appBundleID
-            )
-            return route.usesPrivateAI && self.isPrivateProviderConfigured(settings: settings)
-        }
 
         let route = DictationProviderRoute.resolve(
             settings: settings,
             dictationSlot: slot,
             appBundleID: appBundleID
         )
-        guard !route.usesPrivateAI else { return false }
+        if route.usesPrivateAI {
+            return self.isPrivateProviderConfigured(settings: settings)
+        }
         return self.isProviderConfigured(route: route, settings: settings)
     }
 
@@ -44,6 +40,15 @@ enum DictationAIPostProcessingGate {
     static func isProviderConfigured() -> Bool {
         let settings = SettingsStore.shared
         let route = DictationProviderRoute.resolve(settings: settings)
+        if route.usesPrivateAI {
+            return self.isPrivateProviderConfigured(settings: settings)
+        }
+        return self.isProviderConfigured(route: route, settings: settings)
+    }
+
+    static func isProviderConfigured(providerID: String, model: String) -> Bool {
+        let settings = SettingsStore.shared
+        let route = DictationProviderRoute.resolve(settings: settings, providerID: providerID, model: model)
         if route.usesPrivateAI {
             return self.isPrivateProviderConfigured(settings: settings)
         }

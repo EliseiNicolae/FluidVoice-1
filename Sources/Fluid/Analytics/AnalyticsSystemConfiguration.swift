@@ -4,10 +4,12 @@ import Foundation
 struct AnalyticsSystemConfiguration: Equatable {
     let ramGB: Int
     let chip: String
+    let osVersion: String
 
     static let current = AnalyticsSystemConfiguration(
         ramGB: Self.installedRAMInGigabytes,
-        chip: Self.sysctlString("machdep.cpu.brand_string") ?? "unknown"
+        chip: Self.sysctlString("machdep.cpu.brand_string") ?? "unknown",
+        osVersion: ProcessInfo.processInfo.operatingSystemVersionString
     )
 
     private static var installedRAMInGigabytes: Int {

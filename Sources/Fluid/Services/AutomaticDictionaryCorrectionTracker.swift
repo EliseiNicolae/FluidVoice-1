@@ -2,240 +2,10 @@ import AppKit
 import ApplicationServices
 import Foundation
 
-struct AutomaticDictionaryCorrectionCandidate: Equatable, Identifiable {
-    let id = UUID()
-    let heardText: String
-    let correctedText: String
-}
-
-struct AutomaticDictionaryTextChange: Equatable {
-    let oldRange: NSRange
-    let newRange: NSRange
-}
-
-enum AutomaticDictionaryCorrectionDetector {
-    private static let edgeCharacters = CharacterSet.whitespacesAndNewlines.union(
-        CharacterSet(charactersIn: ".,!?;:\"“”‘’()[]{}")
-    )
-    private static let boundaryCharacters = CharacterSet.whitespacesAndNewlines.union(
-        CharacterSet(charactersIn: ",!?;:\"“”()[]{}<>")
-    )
-    private static let maxCandidateLength = 40
-    private static let maxCombinedLength = 70
-    private static let maxWords = 3
-
-    static func textChange(before: String, after: String) -> AutomaticDictionaryTextChange? {
-        guard before != after else { return nil }
-
-        let oldText = before as NSString
-        let newText = after as NSString
-        let sharedLength = min(oldText.length, newText.length)
-        var prefixLength = 0
-
-        while prefixLength < sharedLength,
-              oldText.character(at: prefixLength) == newText.character(at: prefixLength)
-        {
-            prefixLength += 1
-        }
-
-        var suffixLength = 0
-        let oldRemaining = oldText.length - prefixLength
-        let newRemaining = newText.length - prefixLength
-        while suffixLength < min(oldRemaining, newRemaining),
-              oldText.character(at: oldText.length - suffixLength - 1) ==
-              newText.character(at: newText.length - suffixLength - 1)
-        {
-            suffixLength += 1
-        }
-
-        return AutomaticDictionaryTextChange(
-            oldRange: NSRange(
-                location: prefixLength,
-                length: oldText.length - prefixLength - suffixLength
-            ),
-            newRange: NSRange(
-                location: prefixLength,
-                length: newText.length - prefixLength - suffixLength
-            )
-        )
-    }
-
-    static func isChangeInsideInsertedRange(
-        _ change: AutomaticDictionaryTextChange,
-        insertedRange: NSRange,
-        allowsInsertionAtEnd: Bool = false
-    ) -> Bool {
-        guard insertedRange.location != NSNotFound, insertedRange.length > 0 else { return false }
-        let insertedEnd = NSMaxRange(insertedRange)
-
-        if change.oldRange.length == 0 {
-            return change.oldRange.location >= insertedRange.location &&
-                (change.oldRange.location < insertedEnd ||
-                    (allowsInsertionAtEnd && change.oldRange.location == insertedEnd))
-        }
-
-        return change.oldRange.location >= insertedRange.location &&
-            NSMaxRange(change.oldRange) <= insertedEnd
-    }
-
-    static func candidate(
-        before: String,
-        after: String,
-        insertedRange: NSRange,
-        allowsInsertionAtEnd: Bool = false
-    ) -> AutomaticDictionaryCorrectionCandidate? {
-        guard let change = self.textChange(before: before, after: after),
-              self.isChangeInsideInsertedRange(
-                  change,
-                  insertedRange: insertedRange,
-                  allowsInsertionAtEnd: allowsInsertionAtEnd
-              )
-        else {
-            return nil
-        }
-
-        let oldTokenRange = self.expandedTokenRange(in: before, around: change.oldRange)
-        let newTokenRange = self.expandedTokenRange(in: after, around: change.newRange)
-        guard oldTokenRange.location >= insertedRange.location,
-              NSMaxRange(oldTokenRange) <= NSMaxRange(insertedRange)
-        else {
-            return nil
-        }
-
-        let heard = self.cleanedCandidate((before as NSString).substring(with: oldTokenRange))
-        let corrected = self.cleanedCandidate((after as NSString).substring(with: newTokenRange))
-        guard self.isValidCandidate(heard),
-              self.isValidCandidate(corrected),
-              self.isMeaningfulCorrection(heard: heard, corrected: corrected),
-              heard != corrected,
-              heard.caseInsensitiveCompare(corrected) != .orderedSame,
-              heard.count + corrected.count <= self.maxCombinedLength
-        else {
-            return nil
-        }
-
-        return AutomaticDictionaryCorrectionCandidate(
-            heardText: heard,
-            correctedText: corrected
-        )
-    }
-
-    static func isWordContinuationAtInsertedRangeEnd(
-        _ change: AutomaticDictionaryTextChange,
-        after: String,
-        insertedRange: NSRange
-    ) -> Bool {
-        guard change.oldRange.length == 0,
-              change.oldRange.location == NSMaxRange(insertedRange),
-              NSMaxRange(change.newRange) <= (after as NSString).length
-        else { return false }
-        let insertedText = (after as NSString).substring(with: change.newRange)
-        return !insertedText.isEmpty && insertedText.unicodeScalars.allSatisfy {
-            !self.boundaryCharacters.contains($0)
-        }
-    }
-
-    static func correctedTokenRange(before: String, after: String) -> NSRange? {
-        guard let change = self.textChange(before: before, after: after) else { return nil }
-        return self.expandedTokenRange(in: after, around: change.newRange)
-    }
-
-    static func selectionTouchesCandidate(_ selection: NSRange, candidateRange: NSRange) -> Bool {
-        guard selection.location != NSNotFound, candidateRange.location != NSNotFound else { return false }
-        if selection.length == 0 {
-            return selection.location >= candidateRange.location &&
-                selection.location <= NSMaxRange(candidateRange)
-        }
-        return NSIntersectionRange(selection, candidateRange).length > 0
-    }
-
-    static func changeContinuesCandidate(
-        _ change: AutomaticDictionaryTextChange,
-        after: String,
-        candidateRange: NSRange
-    ) -> Bool {
-        if change.oldRange.length > 0 {
-            return NSIntersectionRange(change.oldRange, candidateRange).length > 0
-        }
-
-        guard change.oldRange.location >= candidateRange.location,
-              change.oldRange.location <= NSMaxRange(candidateRange)
-        else {
-            return false
-        }
-
-        guard change.oldRange.location == NSMaxRange(candidateRange) else { return true }
-        let text = after as NSString
-        guard change.newRange.location != NSNotFound,
-              NSMaxRange(change.newRange) <= text.length
-        else {
-            return false
-        }
-        let insertedText = text.substring(with: change.newRange)
-        return insertedText.unicodeScalars.allSatisfy { !self.boundaryCharacters.contains($0) }
-    }
-
-    private static func expandedTokenRange(in text: String, around range: NSRange) -> NSRange {
-        let nsText = text as NSString
-        let safeLocation = max(0, min(range.location, nsText.length))
-        let safeEnd = max(safeLocation, min(NSMaxRange(range), nsText.length))
-        var start = safeLocation
-        var end = safeEnd
-
-        while start > 0, !self.isBoundary(nsText.character(at: start - 1)) {
-            start -= 1
-        }
-        while end < nsText.length, !self.isBoundary(nsText.character(at: end)) {
-            end += 1
-        }
-
-        return NSRange(location: start, length: end - start)
-    }
-
-    private static func isBoundary(_ character: unichar) -> Bool {
-        guard let scalar = Unicode.Scalar(character) else { return false }
-        return self.boundaryCharacters.contains(scalar)
-    }
-
-    private static func cleanedCandidate(_ value: String) -> String {
-        value.trimmingCharacters(in: self.edgeCharacters)
-    }
-
-    private static func isValidCandidate(_ value: String) -> Bool {
-        guard !value.isEmpty,
-              value.count <= self.maxCandidateLength,
-              value.rangeOfCharacter(from: .alphanumerics) != nil
-        else {
-            return false
-        }
-
-        let words = value.split(whereSeparator: { $0.isWhitespace })
-        return !words.isEmpty && words.count <= self.maxWords
-    }
-
-    private static func isMeaningfulCorrection(heard: String, corrected: String) -> Bool {
-        let heardCharacters = heard.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
-        let correctedCharacters = corrected.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
-        guard heardCharacters.count >= 2,
-              correctedCharacters.count >= 2,
-              heardCharacters.contains(where: { CharacterSet.letters.contains($0) }),
-              correctedCharacters.contains(where: { CharacterSet.letters.contains($0) })
-        else {
-            return false
-        }
-
-        let heardSemantic = String(String.UnicodeScalarView(heardCharacters)).lowercased()
-        let correctedSemantic = String(String.UnicodeScalarView(correctedCharacters)).lowercased()
-        return heardSemantic != correctedSemantic
-    }
-}
-
 struct DictionarySuggestionPolicyConfig {
     var requiredOccurrences = 2
     var occurrenceWindow: TimeInterval = 7 * 24 * 60 * 60
-    var globalCooldown: TimeInterval = 10 * 60
     var dismissedPairCooldown: TimeInterval = 7 * 24 * 60 * 60
-    var maximumPairDismissals = 3
     var maximumSessionIgnores = 3
     var retentionDuration: TimeInterval = 30 * 24 * 60 * 60
     var maximumStoredPairs = 200
@@ -243,12 +13,16 @@ struct DictionarySuggestionPolicyConfig {
 
 enum AutomaticDictionarySuggestionOutcome {
     case accepted
+    case ignored
     case dismissed
     case timedOut
 }
 
 @MainActor
 final class AutomaticDictionarySuggestionPolicy {
+    // Explicitly nonisolated: on macOS 15.4+ the synthesized main-actor deinit can abort until the OS runtime has the fix (swiftlang/swift#88036).
+    nonisolated deinit {}
+
     static let shared = AutomaticDictionarySuggestionPolicy()
 
     private struct PairRecord: Codable {
@@ -257,13 +31,11 @@ final class AutomaticDictionarySuggestionPolicy {
         var occurrences: [Date] = []
         var lastShownAt: Date?
         var dismissedUntil: Date?
-        var dismissalCount = 0
         var isAccepted = false
     }
 
     private struct PersistedState: Codable {
         var records: [String: PairRecord] = [:]
-        var lastShownAt: Date?
     }
 
     private static let defaultsKey = "AutomaticDictionarySuggestionPolicyStateV1"
@@ -288,7 +60,11 @@ final class AutomaticDictionarySuggestionPolicy {
         }
     }
 
-    func shouldShow(_ candidate: AutomaticDictionaryCorrectionCandidate, now: Date = Date()) -> Bool {
+    func shouldShow(
+        _ candidate: AutomaticDictionaryCorrectionCandidate,
+        requiredOccurrences: Int? = nil,
+        now: Date = Date()
+    ) -> Bool {
         self.prune(now: now)
         let key = self.key(for: candidate)
         var record = self.state.records[key] ?? PairRecord(
@@ -300,12 +76,16 @@ final class AutomaticDictionarySuggestionPolicy {
         self.state.records[key] = record
         self.save()
 
+        let correctedText = self.normalized(candidate.correctedText)
+        let occurrenceCount = self.state.records.values
+            .filter { self.normalized($0.correctedText) == correctedText }
+            .flatMap(\.occurrences)
+            .filter { now.timeIntervalSince($0) <= self.configuration.occurrenceWindow }
+            .count
         guard !record.isAccepted,
-              record.dismissalCount < self.configuration.maximumPairDismissals,
               record.dismissedUntil.map({ $0 <= now }) ?? true,
-              record.occurrences.count >= self.configuration.requiredOccurrences,
-              self.sessionIgnoreCount < self.configuration.maximumSessionIgnores,
-              self.state.lastShownAt.map({ now.timeIntervalSince($0) >= self.configuration.globalCooldown }) ?? true
+              occurrenceCount >= (requiredOccurrences ?? self.configuration.requiredOccurrences),
+              self.sessionIgnoreCount < self.configuration.maximumSessionIgnores
         else {
             return false
         }
@@ -317,7 +97,6 @@ final class AutomaticDictionarySuggestionPolicy {
         guard var record = self.state.records[key] else { return }
         record.lastShownAt = now
         self.state.records[key] = record
-        self.state.lastShownAt = now
         self.save()
     }
 
@@ -329,11 +108,10 @@ final class AutomaticDictionarySuggestionPolicy {
         let key = self.key(for: candidate)
         guard var record = self.state.records[key] else { return }
         switch outcome {
-        case .accepted:
+        case .accepted, .ignored:
             record.isAccepted = true
             record.dismissedUntil = nil
         case .dismissed, .timedOut:
-            record.dismissalCount += 1
             record.dismissedUntil = now.addingTimeInterval(self.configuration.dismissedPairCooldown)
             self.sessionIgnoreCount += 1
         }
@@ -383,6 +161,7 @@ final class AutomaticDictionaryCorrectionTracker {
         let pid: pid_t
         let expectedValue: String
         let insertedRange: NSRange
+        let selection: NSRange
     }
 
     private struct PendingCorrection {
@@ -399,7 +178,10 @@ final class AutomaticDictionaryCorrectionTracker {
         let pid: pid_t
         let observesSelectionChanges: Bool
         let observesFocusChanges: Bool
+        let learningRecording: DictionaryLearningRecording?
+        let correctionRecording: DictionaryCorrectionRecording?
         var lastValue: String
+        var lastSelection: NSRange
         var insertedRange: NSRange
         var pendingCorrection: PendingCorrection?
     }
@@ -407,21 +189,35 @@ final class AutomaticDictionaryCorrectionTracker {
     private static let maximumFieldLength = 100_000
     private static let verificationAttempts = 20
     private static let verificationDelayNanoseconds: UInt64 = 50_000_000
-    private static let observationDurationNanoseconds: UInt64 = 30_000_000_000
-    private static let completionSignalDelayNanoseconds: UInt64 = 1_000_000_000
-    private static let inactivityFallbackNanoseconds: UInt64 = 3_000_000_000
+    nonisolated static func observationDuration(hasVoiceSpellings: Bool) -> Duration {
+        // Keep observing through confirmation and the edit debounce. Ordinary dictations stay short.
+        hasVoiceSpellings ? DictionaryVoiceSpellingLearner.confirmationWindow + .seconds(5) : .seconds(30)
+    }
+
+    private static var completionSignalDelayNanoseconds: UInt64 {
+        SettingsStore.shared.automaticDictionaryPromptDelay.completionNanoseconds
+    }
+
+    private static var inactivityFallbackNanoseconds: UInt64 {
+        SettingsStore.shared.automaticDictionaryPromptDelay.inactivityNanoseconds
+    }
 
     private var observer: AXObserver?
     private var session: ObservationSession?
     private var verificationTask: Task<Void, Never>?
     private var timeoutTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
+    private var evidencePreparationTask: Task<Void, Never>?
+    private var suggestionGeneration = UUID()
 
     private init() {}
 
-    func beginObservingInsertion(_ insertedText: String, targetPID: pid_t?) {
+    func beginObservingInsertion(
+        _ insertedText: String, targetPID: pid_t?, learningRecording: DictionaryLearningRecording? = nil,
+        correctionRecording: DictionaryCorrectionRecording? = nil
+    ) {
         self.cancel()
-        guard SettingsStore.shared.automaticDictionaryLearningEnabled,
+        guard SettingsStore.shared.automaticDictionaryLearningEnabled || DictionaryMatcherExperiment.collectNegatives,
               !insertedText.isEmpty
         else {
             return
@@ -429,34 +225,35 @@ final class AutomaticDictionaryCorrectionTracker {
 
         self.verificationTask = Task { @MainActor [weak self] in
             for _ in 0..<Self.verificationAttempts {
-                guard !Task.isCancelled, let self else { return }
-                if let seed = self.captureAnchoredInsertion(
+                // Give the paste time to land before probing, and keep the synchronous
+                // Accessibility round trips off the main thread so they never delay
+                // the event tap that delivers the paste itself.
+                try? await Task.sleep(nanoseconds: Self.verificationDelayNanoseconds)
+                guard !Task.isCancelled, self != nil else { return }
+                let seed = await Self.captureAnchoredInsertionOffMain(
                     insertedText: insertedText,
                     targetPID: targetPID
-                ) {
-                    self.installObserver(for: seed)
+                )
+                guard !Task.isCancelled, let self else { return }
+                if let seed {
+                    self.installObserver(for: seed, learningRecording: DictionaryMatcherExperiment.sharedFeaturesEnabled ? learningRecording : nil, correctionRecording: correctionRecording)
                     return
                 }
-                try? await Task.sleep(nanoseconds: Self.verificationDelayNanoseconds)
             }
         }
     }
 
     func cancel() {
-        self.verificationTask?.cancel()
-        self.verificationTask = nil
-        self.timeoutTask?.cancel()
-        self.timeoutTask = nil
-        self.debounceTask?.cancel()
-        self.debounceTask = nil
-        self.removeObserver()
-        self.session = nil
+        self.suggestionGeneration = UUID()
+        self.evidencePreparationTask?.cancel()
+        self.evidencePreparationTask = nil
+        self.stopObservation()
         DictionaryCorrectionOverlayController.shared.hide()
     }
 
     func handleObservedValueChange() {
         guard var session = self.session,
-              let currentValue = self.stringValue(of: session.element),
+              let currentValue = Self.stringValue(of: session.element),
               currentValue != session.lastValue,
               (currentValue as NSString).length <= Self.maximumFieldLength,
               let change = AutomaticDictionaryCorrectionDetector.textChange(
@@ -477,6 +274,11 @@ final class AutomaticDictionaryCorrectionTracker {
             insertedRange: session.insertedRange,
             allowsInsertionAtEnd: allowsInsertionAtEnd
         )
+
+        // Reject on the edit event, before the debounce can race the confirmation deadline.
+        if isInside, let recording = session.learningRecording {
+            DictionaryVoiceSpellingLearner.shared.cancel(recordingID: recording.id)
+        }
 
         if var pending = session.pendingCorrection {
             let continuesCandidate = pending.correctedRange.map {
@@ -542,13 +344,18 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     func handleObservedSelectionChange() {
-        guard let session = self.session,
-              let pending = session.pendingCorrection,
-              let correctedRange = pending.correctedRange,
-              let selection = self.selectedRange(of: session.element)
+        guard var session = self.session,
+              let selection = Self.selectedRange(of: session.element),
+              selection != session.lastSelection
         else {
             return
         }
+        // Some editors repeat this notification while the caret has not moved.
+        // Keep the original deadline, but still track real moves before any edit.
+        session.lastSelection = selection
+        self.session = session
+        guard let pending = session.pendingCorrection,
+              let correctedRange = pending.correctedRange else { return }
 
         let delay = AutomaticDictionaryCorrectionDetector.selectionTouchesCandidate(
             selection,
@@ -560,7 +367,7 @@ final class AutomaticDictionaryCorrectionTracker {
     func handleObservedFocusChange() {
         guard let session = self.session,
               let pending = session.pendingCorrection,
-              let focus = self.focusedElementAndPID(),
+              let focus = Self.focusedElementAndPID(),
               focus.pid != session.pid || !CFEqual(focus.element, session.element)
         else {
             return
@@ -571,16 +378,34 @@ final class AutomaticDictionaryCorrectionTracker {
         )
     }
 
-    private func captureAnchoredInsertion(
+    private nonisolated static let accessibilityProbeQueue = DispatchQueue(
+        label: "com.fluidvoice.dictionary-correction.ax-probe",
+        qos: .userInitiated
+    )
+
+    private nonisolated static func captureAnchoredInsertionOffMain(
+        insertedText: String,
+        targetPID: pid_t?
+    ) async -> InsertionSeed? {
+        await withCheckedContinuation { continuation in
+            self.accessibilityProbeQueue.async {
+                continuation.resume(
+                    returning: self.captureAnchoredInsertion(insertedText: insertedText, targetPID: targetPID)
+                )
+            }
+        }
+    }
+
+    private nonisolated static func captureAnchoredInsertion(
         insertedText: String,
         targetPID: pid_t?
     ) -> InsertionSeed? {
-        guard let focus = self.focusedElementAndPID(),
+        guard let focus = focusedElementAndPID(),
               targetPID == nil || focus.pid == targetPID,
-              !self.isSecureTextInput(focus.element),
-              let value = self.stringValue(of: focus.element),
+              !Self.isSecureTextInput(focus.element),
+              let value = stringValue(of: focus.element),
               (value as NSString).length <= Self.maximumFieldLength,
-              let selectedRange = self.selectedRange(of: focus.element),
+              let selectedRange = Self.selectedRange(of: focus.element),
               selectedRange.length == 0
         else {
             return nil
@@ -600,11 +425,12 @@ final class AutomaticDictionaryCorrectionTracker {
             element: focus.element,
             pid: focus.pid,
             expectedValue: value,
-            insertedRange: insertedRange
+            insertedRange: insertedRange,
+            selection: selectedRange
         )
     }
 
-    private func installObserver(for seed: InsertionSeed) {
+    private func installObserver(for seed: InsertionSeed, learningRecording: DictionaryLearningRecording?, correctionRecording: DictionaryCorrectionRecording?) {
         self.verificationTask = nil
         var createdObserver: AXObserver?
         let createResult = AXObserverCreate(seed.pid, automaticDictionaryAXObserverCallback, &createdObserver)
@@ -640,14 +466,21 @@ final class AutomaticDictionaryCorrectionTracker {
             pid: seed.pid,
             observesSelectionChanges: selectionResult == .success,
             observesFocusChanges: focusResult == .success,
+            learningRecording: learningRecording,
+            correctionRecording: correctionRecording,
             lastValue: seed.expectedValue,
+            lastSelection: seed.selection,
             insertedRange: seed.insertedRange,
             pendingCorrection: nil
         )
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(createdObserver), .commonModes)
 
+        if let learningRecording {
+            DictionaryVoiceSpellingLearner.shared.propose(learningRecording.alignment.voiceSpellings, recordingID: learningRecording.id)
+        }
+        let duration = Self.observationDuration(hasVoiceSpellings: learningRecording?.alignment.voiceSpellings.isEmpty == false)
         self.timeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.observationDurationNanoseconds)
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
             self?.cancel()
         }
@@ -670,13 +503,50 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     private func evaluate(_ pending: PendingCorrection) {
-        let candidate = AutomaticDictionaryCorrectionDetector.candidate(
+        var candidate = AutomaticDictionaryCorrectionDetector.candidate(
             before: pending.beforeValue,
             after: pending.afterValue,
             insertedRange: pending.insertedRange,
             allowsInsertionAtEnd: true
         )
+        if let candidate {
+            DictionaryVoiceSpellingLearner.shared.reject(editedText: candidate.heardText)
+        }
+        var context: DictionaryLearningCorrectionContext?
+        if DictionaryMatcherExperiment.sharedFeaturesEnabled, let recording = self.session?.learningRecording, let range = candidate?.sourceUTF16Range {
+            let before = pending.beforeValue as NSString
+            let insertion = pending.insertedRange
+            if insertion.location >= 0, insertion.location <= before.length,
+               insertion.length >= 0, insertion.length <= before.length - insertion.location
+            {
+                context = DictionaryLearningCorrectionContext(
+                    recording: recording, deliveredTextBeforeEdit: before.substring(with: insertion), selectedUTF16Range: range
+                )
+            }
+        }
+        if let detected = candidate, let recording = self.session?.correctionRecording {
+            candidate?.trainingExample = DictionaryCorrectionExample.make(
+                id: detected.id,
+                recording: recording,
+                before: pending.beforeValue,
+                after: pending.afterValue,
+                insertedRange: pending.insertedRange,
+                heardWord: detected.heardText,
+                correctedWord: detected.correctedText
+            )
+        }
         self.stopObservation()
+
+        if let candidate, let context, DictionaryMatcherExperiment.collectNegatives,
+           !SettingsStore.shared.shouldShowOnboarding, !AppServices.shared.asr.isRunning,
+           !DictionaryCorrectionOverlayController.shared.isPresented,
+           let negative = DictionaryNegativeEvidenceResolver.resolve(context: context, heard: candidate.heardText, corrected: candidate.correctedText)
+        {
+            var prepared = candidate
+            prepared.negativeCorrection = negative
+            DictionaryCorrectionOverlayController.shared.show(candidate: prepared) { _ in }
+            return
+        }
 
         guard let candidate,
               SettingsStore.shared.automaticDictionaryLearningEnabled,
@@ -684,14 +554,41 @@ final class AutomaticDictionaryCorrectionTracker {
               !self.isAlreadySaved(candidate),
               !AppServices.shared.asr.isRunning,
               !DictionaryCorrectionOverlayController.shared.isPresented,
-              AutomaticDictionarySuggestionPolicy.shared.shouldShow(candidate)
+              AutomaticDictionarySuggestionPolicy.shared.shouldShow(
+                  candidate,
+                  requiredOccurrences: SettingsStore.shared.automaticDictionarySuggestionFrequency.rawValue
+              )
         else {
             return
         }
 
-        AutomaticDictionarySuggestionPolicy.shared.markShown(candidate)
-        DictionaryCorrectionOverlayController.shared.show(candidate: candidate) { outcome in
-            AutomaticDictionarySuggestionPolicy.shared.record(outcome, for: candidate)
+        let generation = self.suggestionGeneration
+        let pronunciationGeneration = DictionaryMatcherExperiment.generation
+        self.evidencePreparationTask = Task { @MainActor [weak self, context] in
+            let observedText = candidate.heardText
+            let evidence = await Task.detached(priority: .utility) {
+                guard DictionaryMatcherExperiment.sharedFeaturesEnabled, pronunciationGeneration == DictionaryMatcherExperiment.generation,
+                      let context else { return DictionaryLearningAudioEvidence?.none }
+                return try? DictionaryLearningAlignmentResolver.resolve(
+                    recording: context.recording,
+                    deliveredTextBeforeEdit: context.deliveredTextBeforeEdit,
+                    selectedUTF16Range: context.selectedUTF16Range,
+                    observedText: observedText
+                )
+            }.value
+            guard !Task.isCancelled, let self, self.suggestionGeneration == generation,
+                  SettingsStore.shared.automaticDictionaryLearningEnabled,
+                  !SettingsStore.shared.shouldShowOnboarding,
+                  !self.isAlreadySaved(candidate), !AppServices.shared.asr.isRunning,
+                  !DictionaryCorrectionOverlayController.shared.isPresented
+            else { return }
+            var prepared = candidate
+            prepared.audioEvidence = DictionaryMatcherExperiment.sharedFeaturesEnabled && pronunciationGeneration == DictionaryMatcherExperiment.generation ? evidence : nil
+            self.evidencePreparationTask = nil
+            AutomaticDictionarySuggestionPolicy.shared.markShown(prepared)
+            DictionaryCorrectionOverlayController.shared.show(candidate: prepared) { outcome in
+                AutomaticDictionarySuggestionPolicy.shared.record(outcome, for: prepared)
+            }
         }
     }
 
@@ -704,21 +601,21 @@ final class AutomaticDictionaryCorrectionTracker {
         }
     }
 
-    private func stringValue(of element: AXUIElement) -> String? {
+    private nonisolated static func stringValue(of element: AXUIElement) -> String? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
         guard result == .success else { return nil }
         return value as? String
     }
 
-    private func isSecureTextInput(_ element: AXUIElement) -> Bool {
+    private nonisolated static func isSecureTextInput(_ element: AXUIElement) -> Bool {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &value)
         guard result == .success, let subrole = value as? String else { return false }
         return subrole == (kAXSecureTextFieldSubrole as String) || subrole.localizedCaseInsensitiveContains("secure")
     }
 
-    private func selectedRange(of element: AXUIElement) -> NSRange? {
+    private nonisolated static func selectedRange(of element: AXUIElement) -> NSRange? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value)
         guard result == .success,
@@ -739,7 +636,7 @@ final class AutomaticDictionaryCorrectionTracker {
         return NSRange(location: range.location, length: range.length)
     }
 
-    private func focusedElementAndPID() -> (element: AXUIElement, pid: pid_t)? {
+    private nonisolated static func focusedElementAndPID() -> (element: AXUIElement, pid: pid_t)? {
         let systemWideElement = AXUIElementCreateSystemWide()
         var focusedElement: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
@@ -761,6 +658,9 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     private func stopObservation() {
+        if let recording = self.session?.learningRecording {
+            DictionaryVoiceSpellingLearner.shared.cancel(recordingID: recording.id)
+        }
         self.verificationTask?.cancel()
         self.verificationTask = nil
         self.timeoutTask?.cancel()
@@ -804,6 +704,8 @@ private let automaticDictionaryAXObserverCallback: AXObserverCallback = { _, _, 
         case kAXValueChangedNotification as String:
             tracker.handleObservedValueChange()
         case kAXSelectedTextChangedNotification as String:
+            // Web-backed editors may move the caret without emitting a value-change notification.
+            tracker.handleObservedValueChange()
             tracker.handleObservedSelectionChange()
         case kAXFocusedUIElementChangedNotification as String:
             tracker.handleObservedFocusChange()

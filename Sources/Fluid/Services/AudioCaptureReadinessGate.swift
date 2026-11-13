@@ -125,6 +125,14 @@ final nonisolated class AudioCaptureReadinessGate: @unchecked Sendable {
         )
     }
 
+    #if DEBUG
+    func hasRegisteredWaiter(sessionID: Int, attemptID: UInt64) -> Bool {
+        self.lock.withLock {
+            self.key == Key(sessionID: sessionID, attemptID: attemptID) && self.waiter != nil
+        }
+    }
+    #endif
+
     private func finish(
         key: Key,
         waiterID: UUID? = nil,

@@ -48,7 +48,7 @@ struct VoiceEngineLanguageRoute: Identifiable, Equatable {
 
     var badgeText: String? {
         switch self.model {
-        case .parakeetTDT, .parakeetTDTv2:
+        case .parakeetTDT, .parakeetTDTv2, .fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro:
             return "Optimized for FluidVoice"
         default:
             return nil
@@ -56,7 +56,22 @@ struct VoiceEngineLanguageRoute: Identifiable, Equatable {
     }
 }
 
+struct AppleSpeechLocaleOption: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+}
+
 enum VoiceEngineLanguageCatalog {
+    static func appleSpeechLocaleOptions(
+        identifiers: [String],
+        displayLocale: Locale = .current
+    ) -> [AppleSpeechLocaleOption] {
+        let uniqueIdentifiers = Set(identifiers.map { Self.normalizedLocaleIdentifier($0) })
+        return uniqueIdentifiers
+            .map { AppleSpeechLocaleOption(id: $0, displayName: displayLocale.localizedString(forIdentifier: $0) ?? $0) }
+            .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+    }
+
     static func allLanguages(
         availableModels: [SettingsStore.SpeechModel] = SettingsStore.SpeechModel.availableModels
     ) -> [VoiceEngineLanguage] {
@@ -148,6 +163,9 @@ enum VoiceEngineLanguageCatalog {
 
         if Self.parakeetV3LanguageIDs.contains(language.id) {
             routes.append(Self.route(language, .parakeetTDT, .automatic))
+            routes.append(Self.route(language, .fluidParakeetMini, .automatic))
+            routes.append(Self.route(language, .fluidParakeetPico, .automatic))
+            routes.append(Self.route(language, .fluidParakeetPro, .automatic))
         }
 
         if let cohereLanguage = Self.cohereLanguage(for: language.id) {
@@ -223,33 +241,7 @@ enum VoiceEngineLanguageCatalog {
         "ar",
     ]
 
-    private static let parakeetV3LanguageIDs: Set<String> = [
-        "bg",
-        "hr",
-        "cs",
-        "da",
-        "nl",
-        "en",
-        "et",
-        "fi",
-        "fr",
-        "de",
-        "el",
-        "hu",
-        "it",
-        "lv",
-        "lt",
-        "mt",
-        "pl",
-        "pt",
-        "ro",
-        "sk",
-        "sl",
-        "es",
-        "sv",
-        "ru",
-        "uk",
-    ]
+    nonisolated static let parakeetV3LanguageIDs = Set(ParakeetSpeechModelCatalog.v3.supportedLanguageCodes)
 
     private static let cohereLanguageMap: [String: SettingsStore.CohereLanguage] = [
         "ar": .arabic,

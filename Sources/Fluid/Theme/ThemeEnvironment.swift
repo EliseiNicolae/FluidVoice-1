@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private struct ThemeKey: EnvironmentKey {
@@ -13,8 +14,17 @@ extension EnvironmentValues {
 
 extension View {
     /// Applies an app theme to the view hierarchy.
+    @ViewBuilder
     func appTheme(_ theme: AppTheme) -> some View {
-        environment(\.theme, theme)
+        Group {
+            if FluidTypography.overridesStandard {
+                self.font(.fluidSystem(.body))
+            } else {
+                self
+            }
+        }
+        .environment(\.theme, theme)
+        .buttonStyle(FluidOutlinedButtonStyle())
     }
 }
 
@@ -58,6 +68,13 @@ extension Color {
         let blue = Double(rgb & 0x0000ff) / 255.0
 
         self.init(red: red, green: green, blue: blue)
+    }
+
+    /// "#RRGGBB" in sRGB, the inverse of `init?(hex:)`.
+    var hexString: String? {
+        guard let rgb = NSColor(self).usingColorSpace(.sRGB) else { return nil }
+        let channel = { (value: CGFloat) in Int((min(max(value, 0), 1) * 255).rounded()) }
+        return String(format: "#%02X%02X%02X", channel(rgb.redComponent), channel(rgb.greenComponent), channel(rgb.blueComponent))
     }
 
     static var fluidGreen: Color {

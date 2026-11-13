@@ -14,6 +14,11 @@ enum AnalyticsDatabaseError: Error {
 
 /// SQLite aggregates and crash-safe upload outbox.
 final class AnalyticsDatabase {
+    private static let performanceBucketUpperBounds = [
+        25, 50, 75, 100, 150, 200, 300, 500, 750, 1000,
+        1500, 2000, 3000, 5000, 7500, 10_000, 20_000, 60_000,
+    ]
+
     private let connection: OpaquePointer
     private let distinctID: String
     private let appVersion: String
@@ -116,6 +121,116 @@ final class AnalyticsDatabase {
         try self.transaction {
             try self.upsertDailyModelUsage(day: self.dayString(date), role: role, mode: mode, descriptor: descriptor)
             try self.enqueueActivityIfNeeded(.coreAction, at: date)
+        }
+    }
+
+    func recordDictationPerformance(
+        asrMilliseconds: Int? = nil,
+        fluidIntelligenceMilliseconds: Int? = nil,
+        fluidModel: AnalyticsFluidIntelligenceModel? = nil,
+        tokensPerSecond: Double? = nil,
+        measuredAppVersion: String,
+        at date: Date
+    ) throws {
+        let validTokensPerSecond = tokensPerSecond.flatMap { value in
+            value.isFinite && value > 0 ? value : nil
+        }
+        guard asrMilliseconds != nil || fluidIntelligenceMilliseconds != nil ||
+            (fluidModel != nil && validTokensPerSecond != nil)
+        else { return }
+        try self.finalizeDays(before: date)
+        let day = self.dayString(date)
+        try self.transaction {
+            if let asrMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "asr",
+                    milliseconds: asrMilliseconds
+                )
+            }
+            if let fluidIntelligenceMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "fluid_intelligence",
+                    milliseconds: fluidIntelligenceMilliseconds
+                )
+            }
+            if let fluidModel, let validTokensPerSecond {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "\(fluidModel.rawValue)_tps",
+                    milliseconds: Int(min(validTokensPerSecond.rounded(), 60_001))
+                )
+            }
+        }
+    }
+
+    func recordInsertionLatency(
+        path: AnalyticsInsertionPath,
+        outcome: AnalyticsInsertionOutcome,
+        requestMilliseconds: Int,
+        readyMilliseconds: Int?,
+        toggleStopMilliseconds: Int? = nil,
+        at date: Date
+    ) throws {
+        try self.finalizeDays(before: date)
+        let requestMilliseconds = max(0, requestMilliseconds)
+        let readyMilliseconds = readyMilliseconds.map { max(0, $0) }
+        let readyCount = readyMilliseconds == nil ? 0 : 1
+        let readyValue = readyMilliseconds ?? 0
+        let day = self.dayString(date)
+
+        try self.transaction {
+            try self.run(
+                "INSERT INTO daily_insertion_latency (" +
+                    "day, delivery_path, outcome, request_count, request_total_ms, request_min_ms, request_max_ms, " +
+                    "ready_count, ready_total_ms, ready_min_ms, ready_max_ms" +
+                    ") VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) " +
+                    "ON CONFLICT(day, delivery_path, outcome) DO UPDATE SET " +
+                    "request_count = request_count + 1, " +
+                    "request_total_ms = request_total_ms + excluded.request_total_ms, " +
+                    "request_min_ms = MIN(request_min_ms, excluded.request_min_ms), " +
+                    "request_max_ms = MAX(request_max_ms, excluded.request_max_ms), " +
+                    "ready_count = ready_count + excluded.ready_count, " +
+                    "ready_total_ms = ready_total_ms + excluded.ready_total_ms, " +
+                    "ready_min_ms = CASE " +
+                    "WHEN excluded.ready_count = 0 THEN ready_min_ms " +
+                    "WHEN ready_count = 0 THEN excluded.ready_min_ms " +
+                    "ELSE MIN(ready_min_ms, excluded.ready_min_ms) END, " +
+                    "ready_max_ms = CASE " +
+                    "WHEN excluded.ready_count = 0 THEN ready_max_ms " +
+                    "WHEN ready_count = 0 THEN excluded.ready_max_ms " +
+                    "ELSE MAX(ready_max_ms, excluded.ready_max_ms) END",
+                bindings: [
+                    .text(day), .text(path.rawValue), .text(outcome.rawValue),
+                    .integer(requestMilliseconds), .integer(requestMilliseconds), .integer(requestMilliseconds),
+                    .integer(readyCount), .integer(readyValue), .integer(readyValue), .integer(readyValue),
+                ]
+            )
+
+            if let toggleStopMilliseconds,
+               outcome == .dispatched,
+               path == .clipboard || path == .clipboardFallback
+            {
+                let milliseconds = max(0, toggleStopMilliseconds)
+                try self.run(
+                    "INSERT INTO daily_clipboard_toggle_latency " +
+                        "(day, delivery_path, sample_count, total_ms, min_ms, max_ms) " +
+                        "VALUES (?, ?, 1, ?, ?, ?) " +
+                        "ON CONFLICT(day, delivery_path) DO UPDATE SET " +
+                        "sample_count = sample_count + 1, " +
+                        "total_ms = total_ms + excluded.total_ms, " +
+                        "min_ms = MIN(min_ms, excluded.min_ms), " +
+                        "max_ms = MAX(max_ms, excluded.max_ms)",
+                    bindings: [
+                        .text(day), .text(path.rawValue),
+                        .integer(milliseconds), .integer(milliseconds), .integer(milliseconds),
+                    ]
+                )
+            }
         }
     }
 
@@ -370,8 +485,28 @@ final class AnalyticsDatabase {
                 "WHERE day < ? ORDER BY day, role, mode, provider, model",
             bindings: [.text(today)]
         )
+        let performanceRows = try self.query(
+            "SELECT day, measured_app_version, measured_os_version, metric, bucket_index, sample_count " +
+                "FROM daily_dictation_performance WHERE day < ? " +
+                "ORDER BY day, measured_app_version, measured_os_version, metric, bucket_index",
+            bindings: [.text(today)]
+        )
 
-        guard !usageRows.isEmpty || !modelRows.isEmpty else { return }
+        let insertionRows = try self.query(
+            "SELECT day, delivery_path, outcome, request_count, request_total_ms, request_min_ms, " +
+                "request_max_ms, ready_count, ready_total_ms, ready_min_ms, ready_max_ms " +
+                "FROM daily_insertion_latency WHERE day < ? ORDER BY day, delivery_path, outcome",
+            bindings: [.text(today)]
+        )
+        let clipboardToggleRows = try self.query(
+            "SELECT day, delivery_path, sample_count, total_ms, min_ms, max_ms " +
+                "FROM daily_clipboard_toggle_latency WHERE day < ? ORDER BY day, delivery_path",
+            bindings: [.text(today)]
+        )
+
+        guard !usageRows.isEmpty || !modelRows.isEmpty || !performanceRows.isEmpty ||
+            !insertionRows.isEmpty || !clipboardToggleRows.isEmpty
+        else { return }
         try self.transaction {
             for row in usageRows where row.count == 5 {
                 try self.enqueue(.usageDailySummary, at: date, properties: [
@@ -392,8 +527,53 @@ final class AnalyticsDatabase {
                     "use_count": Int(row[5]) ?? 0,
                 ])
             }
+            for summary in self.performanceSummaries(from: performanceRows) {
+                try self.enqueue(.dictationPerformanceDailySummary, at: date, properties: summary.properties)
+            }
+            for row in insertionRows where row.count == 11 {
+                let requestCount = Int(row[3]) ?? 0
+                let requestTotal = Int(row[4]) ?? 0
+                let readyCount = Int(row[7]) ?? 0
+                let readyTotal = Int(row[8]) ?? 0
+                let toggleRow = clipboardToggleRows.first {
+                    $0.count == 6 &&
+                        row[2] == AnalyticsInsertionOutcome.dispatched.rawValue &&
+                        $0[0] == row[0] &&
+                        $0[1] == row[1]
+                }
+                var properties: [String: Any] = [
+                    "latency_date": row[0],
+                    "delivery_path": row[1],
+                    "outcome": row[2],
+                    "request_count": requestCount,
+                    "request_total_ms": requestTotal,
+                    "request_average_ms": Self.average(total: requestTotal, count: requestCount),
+                    "request_min_ms": Int(row[5]) ?? 0,
+                    "request_max_ms": Int(row[6]) ?? 0,
+                    "ready_count": readyCount,
+                ]
+                if readyCount > 0 {
+                    properties["ready_total_ms"] = readyTotal
+                    properties["ready_average_ms"] = Self.average(total: readyTotal, count: readyCount)
+                    properties["ready_min_ms"] = Int(row[9]) ?? 0
+                    properties["ready_max_ms"] = Int(row[10]) ?? 0
+                }
+                if let toggleRow {
+                    let count = Int(toggleRow[2]) ?? 0
+                    let total = Int(toggleRow[3]) ?? 0
+                    properties["toggle_stop_to_dispatch_count"] = count
+                    properties["toggle_stop_to_dispatch_total_ms"] = total
+                    properties["toggle_stop_to_dispatch_average_ms"] = Self.average(total: total, count: count)
+                    properties["toggle_stop_to_dispatch_min_ms"] = Int(toggleRow[4]) ?? 0
+                    properties["toggle_stop_to_dispatch_max_ms"] = Int(toggleRow[5]) ?? 0
+                }
+                try self.enqueue(.insertionLatencyDailySummary, at: date, properties: properties)
+            }
             try self.run("DELETE FROM daily_usage WHERE day < ?", bindings: [.text(today)])
             try self.run("DELETE FROM daily_model_usage WHERE day < ?", bindings: [.text(today)])
+            try self.run("DELETE FROM daily_insertion_latency WHERE day < ?", bindings: [.text(today)])
+            try self.run("DELETE FROM daily_clipboard_toggle_latency WHERE day < ?", bindings: [.text(today)])
+            try self.run("DELETE FROM daily_dictation_performance WHERE day < ?", bindings: [.text(today)])
         }
     }
 
@@ -473,6 +653,9 @@ final class AnalyticsDatabase {
             try self.execute("DELETE FROM outbox")
             try self.execute("DELETE FROM daily_usage")
             try self.execute("DELETE FROM daily_model_usage")
+            try self.execute("DELETE FROM daily_dictation_performance")
+            try self.execute("DELETE FROM daily_insertion_latency")
+            try self.execute("DELETE FROM daily_clipboard_toggle_latency")
             try self.execute("DELETE FROM event_dedupe")
             try self.execute("DELETE FROM onboarding_flows")
             try self.execute("DELETE FROM onboarding_tryout_state")
@@ -485,11 +668,16 @@ final class AnalyticsDatabase {
     func purgeDetailedAnalytics() throws {
         try self.transaction {
             try self.run(
-                "DELETE FROM outbox WHERE event_name != ?",
-                bindings: [.text(AnalyticsEvent.activeUser.rawValue)]
+                "DELETE FROM outbox WHERE event_name != ? AND event_name != ?",
+                bindings: [
+                    .text(AnalyticsEvent.activeUser.rawValue),
+                    .text(AnalyticsEvent.dictationPerformanceDailySummary.rawValue),
+                ]
             )
             try self.execute("DELETE FROM daily_usage")
             try self.execute("DELETE FROM daily_model_usage")
+            try self.execute("DELETE FROM daily_insertion_latency")
+            try self.execute("DELETE FROM daily_clipboard_toggle_latency")
             try self.run(
                 "DELETE FROM event_dedupe WHERE dedupe_key NOT LIKE ?",
                 bindings: [.text("activity:%")]
@@ -526,6 +714,38 @@ final class AnalyticsDatabase {
             model TEXT NOT NULL,
             use_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(day, role, mode, provider, model)
+        );
+        CREATE TABLE IF NOT EXISTS daily_dictation_performance (
+            day TEXT NOT NULL,
+            measured_app_version TEXT NOT NULL,
+            measured_os_version TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            bucket_index INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day, measured_app_version, measured_os_version, metric, bucket_index)
+        );
+        CREATE TABLE IF NOT EXISTS daily_insertion_latency (
+            day TEXT NOT NULL,
+            delivery_path TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            request_total_ms INTEGER NOT NULL DEFAULT 0,
+            request_min_ms INTEGER NOT NULL DEFAULT 0,
+            request_max_ms INTEGER NOT NULL DEFAULT 0,
+            ready_count INTEGER NOT NULL DEFAULT 0,
+            ready_total_ms INTEGER NOT NULL DEFAULT 0,
+            ready_min_ms INTEGER NOT NULL DEFAULT 0,
+            ready_max_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day, delivery_path, outcome)
+        );
+        CREATE TABLE IF NOT EXISTS daily_clipboard_toggle_latency (
+            day TEXT NOT NULL,
+            delivery_path TEXT NOT NULL,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            total_ms INTEGER NOT NULL DEFAULT 0,
+            min_ms INTEGER NOT NULL DEFAULT 0,
+            max_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day, delivery_path)
         );
         CREATE TABLE IF NOT EXISTS event_dedupe (
             dedupe_key TEXT PRIMARY KEY,
@@ -627,6 +847,139 @@ final class AnalyticsDatabase {
         )
     }
 
+    private func upsertPerformanceMetric(
+        day: String,
+        measuredAppVersion: String,
+        metric: String,
+        milliseconds: Int
+    ) throws {
+        let boundedMilliseconds = min(max(milliseconds, 0), 600_000)
+        let bucketIndex = Self.performanceBucketUpperBounds.firstIndex { boundedMilliseconds <= $0 }
+            ?? Self.performanceBucketUpperBounds.count
+        try self.run(
+            "INSERT INTO daily_dictation_performance " +
+                "(day, measured_app_version, measured_os_version, metric, bucket_index, sample_count) " +
+                "VALUES (?, ?, ?, ?, ?, 1) " +
+                "ON CONFLICT(day, measured_app_version, measured_os_version, metric, bucket_index) " +
+                "DO UPDATE SET sample_count = sample_count + 1",
+            bindings: [
+                .text(day), .text(measuredAppVersion), .text(self.systemConfiguration.osVersion),
+                .text(metric), .integer(bucketIndex),
+            ]
+        )
+    }
+
+    private struct PerformanceSummaryKey: Hashable {
+        let day: String
+        let measuredAppVersion: String
+        let measuredOSVersion: String
+    }
+
+    private struct PerformanceMetricSummary {
+        var bucketCounts = Array(repeating: 0, count: performanceBucketUpperBounds.count + 1)
+        var sampleCount = 0
+    }
+
+    private struct PerformanceSummary {
+        let key: PerformanceSummaryKey
+        var asr = PerformanceMetricSummary()
+        var fluidIntelligence = PerformanceMetricSummary()
+        var picoTPS = PerformanceMetricSummary()
+        var miniTPS = PerformanceMetricSummary()
+
+        var properties: [String: Any] {
+            var properties: [String: Any] = [
+                "performance_date": self.key.day,
+                "measured_app_version": self.key.measuredAppVersion,
+                "measured_os_version": self.key.measuredOSVersion,
+                "histogram_schema_version": 2,
+            ]
+            Self.add(self.asr, prefix: "asr", to: &properties)
+            Self.add(self.fluidIntelligence, prefix: "fluid_intelligence", to: &properties)
+            Self.add(self.picoTPS, prefix: "pico_tps", to: &properties)
+            Self.add(self.miniTPS, prefix: "mini_tps", to: &properties)
+            return properties
+        }
+
+        private static func add(
+            _ metric: PerformanceMetricSummary,
+            prefix: String,
+            to properties: inout [String: Any]
+        ) {
+            properties["\(prefix)_sample_count"] = metric.sampleCount
+            guard metric.sampleCount > 0 else { return }
+            properties["\(prefix)_p50_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.50)
+            properties["\(prefix)_p95_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.95)
+        }
+
+        private static func quantileBucket(_ counts: [Int], percentile: Double) -> String {
+            let target = max(1, Int(ceil(Double(counts.reduce(0, +)) * percentile)))
+            var cumulative = 0
+            for (index, count) in counts.enumerated() {
+                cumulative += count
+                if cumulative >= target {
+                    guard index < performanceBucketUpperBounds.count else { return "60000_plus" }
+                    return String(performanceBucketUpperBounds[index])
+                }
+            }
+            return "unknown"
+        }
+    }
+
+    private func performanceSummaries(from rows: [[String]]) -> [PerformanceSummary] {
+        var summaries: [PerformanceSummaryKey: PerformanceSummary] = [:]
+        for row in rows where row.count == 6 {
+            let key = PerformanceSummaryKey(
+                day: row[0],
+                measuredAppVersion: row[1],
+                measuredOSVersion: row[2]
+            )
+            var summary = summaries[key] ?? PerformanceSummary(key: key)
+            let bucketIndex = Int(row[4]) ?? -1
+            let sampleCount = Int(row[5]) ?? 0
+            if row[3] == "asr" {
+                Self.mergePerformanceRow(
+                    into: &summary.asr,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            } else if row[3] == "fluid_intelligence" {
+                Self.mergePerformanceRow(
+                    into: &summary.fluidIntelligence,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            } else if row[3] == "pico_tps" {
+                Self.mergePerformanceRow(
+                    into: &summary.picoTPS,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            } else if row[3] == "mini_tps" {
+                Self.mergePerformanceRow(
+                    into: &summary.miniTPS,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            }
+            summaries[key] = summary
+        }
+        return summaries.values.sorted {
+            ($0.key.day, $0.key.measuredAppVersion, $0.key.measuredOSVersion) <
+                ($1.key.day, $1.key.measuredAppVersion, $1.key.measuredOSVersion)
+        }
+    }
+
+    private static func mergePerformanceRow(
+        into metric: inout PerformanceMetricSummary,
+        bucketIndex: Int,
+        sampleCount: Int
+    ) {
+        guard metric.bucketCounts.indices.contains(bucketIndex) else { return }
+        metric.bucketCounts[bucketIndex] += sampleCount
+        metric.sampleCount += sampleCount
+    }
+
     private func activeOnboardingFlow(origin: AnalyticsOnboardingOrigin, at date: Date) throws -> String {
         if let existing = try self.string(
             "SELECT flow_id FROM onboarding_flows WHERE completed = 0 AND origin = ? " +
@@ -719,6 +1072,11 @@ final class AnalyticsDatabase {
     private func dayString(_ date: Date) -> String {
         let components = self.calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+    }
+
+    private static func average(total: Int, count: Int) -> Double {
+        guard count > 0 else { return 0 }
+        return (Double(total) / Double(count) * 10).rounded() / 10
     }
 
     private func purgeDeletedPages() throws {

@@ -109,17 +109,31 @@ final nonisolated class ModelPreparationProgressRelay: @unchecked Sendable {
 struct ASRTranscriptionResult {
     let text: String
     let confidence: Float
+    /// FluidAudio's own Parakeet processing time. This excludes FluidVoice
+    /// executor queueing, provider setup, and post-transcription work.
+    let parakeetProcessingDurationMilliseconds: Int?
     let pronunciationEnrollment: PronunciationEnrollmentCapture?
+    let dictionaryLearningAlignment: DictionaryLearningAlignment?
 
     init(
         text: String,
         confidence: Float = 1.0,
-        pronunciationEnrollment: PronunciationEnrollmentCapture? = nil
+        parakeetProcessingDurationMilliseconds: Int? = nil,
+        pronunciationEnrollment: PronunciationEnrollmentCapture? = nil,
+        dictionaryLearningAlignment: DictionaryLearningAlignment? = nil
     ) {
         self.text = text
         self.confidence = confidence
+        self.parakeetProcessingDurationMilliseconds = parakeetProcessingDurationMilliseconds
         self.pronunciationEnrollment = pronunciationEnrollment
+        self.dictionaryLearningAlignment = dictionaryLearningAlignment
     }
+}
+
+nonisolated struct ASRWordTiming: Sendable {
+    let text: String
+    let start: TimeInterval
+    let end: TimeInterval
 }
 
 // MARK: - Transcription Provider Protocol
@@ -155,6 +169,12 @@ protocol TranscriptionProvider {
     /// Transcribe audio captured while training dictionary replacements.
     /// Providers can bypass final-output transforms that would distort the saved phrase.
     func transcribeDictionaryTraining(_ samples: [Float]) async throws -> ASRTranscriptionResult
+    func transcribeDictionaryTraining(_ samples: [Float], capturePronunciation: Bool) async throws -> ASRTranscriptionResult
+
+    /// Meeting word alignment only; dictation never calls the method this gates.
+    var supportsWordTimings: Bool { get }
+
+    func transcribeWithWordTimings(_ samples: [Float]) async throws -> (result: ASRTranscriptionResult, words: [ASRWordTiming])
 
     /// Whether this provider prefers to handle long-form file transcription itself.
     /// This is useful when the backend already has model-native long-audio chunking/reassembly.
@@ -180,12 +200,22 @@ extension TranscriptionProvider {
     func clearCache() async throws {}
     var shouldClearCacheAfterCancellation: Bool { true }
     var prefersNativeFileTranscription: Bool { false }
+    var supportsWordTimings: Bool { false }
+
+    func transcribeWithWordTimings(_ samples: [Float]) async throws -> (result: ASRTranscriptionResult, words: [ASRWordTiming]) {
+        try (await self.transcribe(samples), [])
+    }
+
     func transcribeStreaming(_ samples: [Float]) async throws -> ASRTranscriptionResult {
         try await self.transcribe(samples)
     }
 
     func transcribeFinal(_ samples: [Float]) async throws -> ASRTranscriptionResult {
         try await self.transcribe(samples)
+    }
+
+    func transcribeDictionaryTraining(_ samples: [Float], capturePronunciation: Bool) async throws -> ASRTranscriptionResult {
+        try await self.transcribeDictionaryTraining(samples)
     }
 
     func transcribeDictionaryTraining(_ samples: [Float]) async throws -> ASRTranscriptionResult {

@@ -83,7 +83,7 @@ struct SpokenSendIndicatorView: View {
 
     private func symbol(_ name: String, color: Color, accessibilityLabel: String) -> some View {
         Image(systemName: name)
-            .font(.system(size: max(6, self.size * 0.46), weight: .semibold))
+            .font(.fluidSystem(size: max(6, self.size * 0.46), weight: .semibold))
             .foregroundStyle(color)
             .accessibilityLabel(accessibilityLabel)
     }
@@ -101,12 +101,21 @@ class NotchContentState: ObservableObject {
     @Published var mode: OverlayMode = .dictation
     @Published var promptPickerMode: SettingsStore.PromptMode = .dictate
     @Published var isProcessing: Bool = false // AI processing state
+    @Published var isDictationMuted = false
     @Published var isAIProcessingFailureVisible: Bool = false
     @Published private(set) var aiProcessingFailureMessage: String = "AI Enhancement failed"
     @Published private(set) var canRetryAIProcessingFailure: Bool = true
+    /// Set only while a model download would fix the failure on screen.
+    @Published private(set) var aiProcessingFailureDownloadAction: (() -> Void)?
     @Published private(set) var spokenSendIndicatorState: SpokenSendIndicatorState = .hidden
     @Published private(set) var spokenSendCountdownID: UInt64 = 0
+    @Published var isTextDeliveryFailureVisible: Bool = false
+    @Published private(set) var textDeliveryFailureMessage: String = "Text could not be inserted"
+    private(set) var textDeliveryFailureID = UUID()
+    private(set) var textDeliveryFailureTranscript: String = ""
+    private(set) var textDeliveryFailure: TextDeliveryFailure?
     @Published var activeDictationShortcutSlot: SettingsStore.DictationShortcutSlot? = nil
+    @Published var stopSnapshotLabel: String?
     @Published var promptModeOverrideProfileName: String? = nil // Name shown in overlay when prompt mode hotkey is active
     @Published var promptModeOverrideProfileID: String? = nil // ID of the active override profile (for checkmark in menu)
     @Published var isPromptModeActive: Bool = false // True for the entire prompt-mode session, even when no profile is selected
@@ -120,9 +129,17 @@ class NotchContentState: ObservableObject {
     /// The PID of the app we should restore focus to after interacting with overlays.
     /// Captured at recording start to keep the target stable for the session.
     @Published var recordingTargetPID: pid_t? = nil
+    var recordingTargetContext: TypingService.RecordingTargetContext?
 
-    /// Cached transcription preview text to avoid recomputing on every render
-    @Published private(set) var cachedPreviewText: String = ""
+    /// The preview keeps its source position so trimming cannot move wrapped caption lines.
+    @Published private(set) var captionPreview: OverlayCaptionText = .empty
+    var cachedPreviewText: String { self.captionPreview.text }
+    private var transcriptionSourceOffset = 0
+
+    /// Bounded recovery context for a revision or a chunk that skips past the short preview.
+    var captionContext: OverlayCaptionText {
+        OverlayCaptionText(text: self.transcriptionText, sourceOffset: self.transcriptionSourceOffset)
+    }
 
     // MARK: - Expanded Command Output State
 
@@ -175,21 +192,25 @@ class NotchContentState: ObservableObject {
     func setProcessing(_ processing: Bool) {
         if processing {
             self.clearAIProcessingFailure()
+            self.clearTextDeliveryFailure()
         }
         self.isProcessing = processing
     }
 
     func showAIProcessingFailure(
         message: String = "AI Enhancement failed",
-        canRetry: Bool = true
+        canRetry: Bool = true,
+        downloadAction: (() -> Void)? = nil
     ) {
         self.aiProcessingFailureMessage = message
         self.canRetryAIProcessingFailure = canRetry
+        self.aiProcessingFailureDownloadAction = downloadAction
         self.isAIProcessingFailureVisible = true
     }
 
     func clearAIProcessingFailure() {
         self.isAIProcessingFailureVisible = false
+        self.aiProcessingFailureDownloadAction = nil
     }
 
     func setSpokenSendIndicatorState(_ state: SpokenSendIndicatorState) {
@@ -204,37 +225,45 @@ class NotchContentState: ObservableObject {
         return self.spokenSendCountdownID
     }
 
+    func recordTextDeliveryFailure(_ failure: TextDeliveryFailure, transcript: String) {
+        self.textDeliveryFailureID = UUID()
+        self.textDeliveryFailureTranscript = transcript
+        self.textDeliveryFailure = failure
+        self.textDeliveryFailureMessage = failure.userFacingMessage ?? ""
+        self.isTextDeliveryFailureVisible = failure.userFacingMessage != nil
+    }
+
+    func clearTextDeliveryFailure() {
+        self.isTextDeliveryFailureVisible = false
+        self.textDeliveryFailure = nil
+    }
+
+    @discardableResult
+    func clearTextDeliveryFailure(ifPresentationID id: UUID) -> Bool {
+        guard self.isTextDeliveryFailureVisible, self.textDeliveryFailureID == id else { return false }
+        self.clearTextDeliveryFailure()
+        return true
+    }
+
     /// Update transcription and recompute cached lines
     func updateTranscription(_ text: String) {
-        let boundedText = Self.tailCharacters(in: text, maxCharacters: Self.maxStoredTranscriptionCharacters)
-        guard boundedText != self.transcriptionText else { return }
+        let bounded = OverlayCaptionText.tail(text, limit: Self.maxStoredTranscriptionCharacters)
+        guard bounded.text != self.transcriptionText || bounded.sourceOffset != self.transcriptionSourceOffset else { return }
 
-        self.transcriptionText = boundedText
+        self.transcriptionSourceOffset = bounded.sourceOffset
+        self.transcriptionText = bounded.text
         self.recomputeTranscriptionLines()
     }
 
     /// Recompute cached transcription lines (called only when text changes)
     private func recomputeTranscriptionLines() {
-        let text = self.transcriptionText
-
-        guard !text.isEmpty else {
-            if !self.cachedPreviewText.isEmpty {
-                self.cachedPreviewText = ""
-            }
-            return
-        }
-
-        let maxChars = SettingsStore.shared.transcriptionPreviewCharLimit
-        let previewText = Self.tailCharacters(in: text, maxCharacters: maxChars)
-        guard previewText != self.cachedPreviewText else { return }
-        self.cachedPreviewText = previewText
-    }
-
-    private static func tailCharacters(in text: String, maxCharacters: Int) -> String {
-        guard maxCharacters > 0, !text.isEmpty else { return "" }
-
-        let start = text.index(text.endIndex, offsetBy: -maxCharacters, limitedBy: text.startIndex) ?? text.startIndex
-        return String(text[start..<text.endIndex])
+        let preview = OverlayCaptionText.tail(
+            self.transcriptionText,
+            limit: SettingsStore.shared.transcriptionPreviewCharLimit,
+            sourceOffset: self.transcriptionSourceOffset
+        )
+        guard preview != self.captionPreview else { return }
+        self.captionPreview = preview
     }
 
     // MARK: - Recording State for Expanded View
@@ -260,6 +289,8 @@ class NotchContentState: ObservableObject {
     var onCopyLastRequested: (() -> Void)?
     /// Called when the user requests re-pasting the latest saved transcription entry.
     var onPasteLastRequested: (() -> Void)?
+    /// Called when the user retries the exact transcript from a delivery failure.
+    var onRetryTextDeliveryRequested: ((String) -> Void)?
     /// Called when the user requests undoing AI processing for the latest entry.
     var onUndoLastAIRequested: (() -> Void)?
     /// Called when the user requests opening Preferences.
@@ -379,7 +410,7 @@ extension OverlayMode {
 struct ShimmerText: View {
     let text: String
     let color: Color
-    var font: Font = .system(size: 9, weight: .medium)
+    var font: Font = .fluidSystem(size: 9, weight: .medium)
 
     var body: some View {
         Text(self.text)
@@ -396,17 +427,23 @@ struct ShimmerText: View {
 }
 
 struct CompositorShimmerSweep: NSViewRepresentable {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var duration: CFTimeInterval = 1.0
     var peakOpacity: CGFloat = 0.88
+    var isActive = true
 
     func makeNSView(context: Context) -> CompositorShimmerSweepView {
         let view = CompositorShimmerSweepView()
-        view.configure(duration: self.duration, peakOpacity: self.peakOpacity)
+        view.configure(duration: self.duration, peakOpacity: self.peakOpacity, isActive: self.isActive && !self.reduceMotion)
         return view
     }
 
     func updateNSView(_ nsView: CompositorShimmerSweepView, context: Context) {
-        nsView.configure(duration: self.duration, peakOpacity: self.peakOpacity)
+        nsView.configure(duration: self.duration, peakOpacity: self.peakOpacity, isActive: self.isActive && !self.reduceMotion)
+    }
+
+    static func dismantleNSView(_ nsView: CompositorShimmerSweepView, coordinator: ()) {
+        nsView.configure(duration: 1, peakOpacity: 0, isActive: false)
     }
 }
 
@@ -414,6 +451,8 @@ final class CompositorShimmerSweepView: NSView {
     private let gradientLayer = CAGradientLayer()
     private var animationDuration: CFTimeInterval = 1.0
     private var peakOpacity: CGFloat = 0.88
+    private var isActive = true
+    private var visibilitySubscriptions = Set<AnyCancellable>()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -445,14 +484,35 @@ final class CompositorShimmerSweepView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if self.window == nil {
-            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
-        } else {
-            self.startAnimationIfNeeded()
+        self.visibilitySubscriptions.removeAll()
+        if let window {
+            NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)
+                .filter { [weak window] in $0.object as? NSWindow === window }
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
+            // Alpha-zero panels remain ordered in. Stop on that property change
+            // immediately; occlusion notifications arrive later from WindowServer.
+            window.publisher(for: \.alphaValue, options: [.new])
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
+            window.publisher(for: \.isVisible, options: [.new])
+                .sink { [weak self] _ in self?.updateAnimation() }
+                .store(in: &self.visibilitySubscriptions)
         }
+        self.updateAnimation()
     }
 
-    func configure(duration: CFTimeInterval, peakOpacity: CGFloat) {
+    override func viewDidHide() {
+        super.viewDidHide()
+        self.updateAnimation()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        self.updateAnimation()
+    }
+
+    func configure(duration: CFTimeInterval, peakOpacity: CGFloat, isActive: Bool = true) {
         let clampedDuration = max(duration, 0.2)
         let clampedOpacity = min(max(peakOpacity, 0.0), 1.0)
         let shouldRestart = abs(self.animationDuration - clampedDuration) > 0.01
@@ -460,12 +520,14 @@ final class CompositorShimmerSweepView: NSView {
 
         self.animationDuration = clampedDuration
         self.peakOpacity = clampedOpacity
+        self.isActive = isActive
         if shouldUpdateColors {
             self.updateColors()
         }
         if shouldRestart {
-            self.startAnimationIfNeeded()
+            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
         }
+        self.updateAnimation()
     }
 
     private func updateColors() {
@@ -476,9 +538,15 @@ final class CompositorShimmerSweepView: NSView {
         ]
     }
 
-    private func startAnimationIfNeeded() {
-        guard self.window != nil else { return }
-        self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
+    private func updateAnimation() {
+        guard self.isActive, !self.isHiddenOrHasHiddenAncestor,
+              let window = self.window, window.isVisible, window.alphaValue > 0,
+              window.occlusionState.contains(.visible)
+        else {
+            self.gradientLayer.removeAnimation(forKey: "fluid.shimmer.locations")
+            return
+        }
+        guard self.gradientLayer.animation(forKey: "fluid.shimmer.locations") == nil else { return }
 
         let animation = CABasicAnimation(keyPath: "locations")
         animation.fromValue = [-0.45, -0.15, 0.15]
@@ -498,6 +566,7 @@ struct NotchExpandedView: View {
     let audioPublisher: AnyPublisher<CGFloat, Never>
     @ObservedObject private var contentState = NotchContentState.shared
     @ObservedObject private var settings = SettingsStore.shared
+    @ObservedObject private var promptPresentation = DictationOverlayPresentationStore.shared
     @ObservedObject private var activeAppMonitor = ActiveAppMonitor.shared
     @Environment(\.theme) private var theme
     @State private var isHoveringPromptChip = false
@@ -593,20 +662,21 @@ struct NotchExpandedView: View {
     }
 
     private var promptResolutionBundleID: String? {
-        self.activeAppMonitor.activeAppBundleID
+        DictationAppSession.shared.appID
     }
 
     private var activeDictationShortcutSlot: SettingsStore.DictationShortcutSlot {
         self.contentState.activeDictationShortcutSlot ?? .primary
     }
 
+    private var dictationPresentation: DictationOverlayPresentation {
+        self.activeDictationShortcutSlot == .secondary ? self.promptPresentation.value.secondary : self.promptPresentation.value.primary
+    }
+
     private var isAppPromptOverrideActive: Bool {
         guard let activePromptMode else { return false }
         if activePromptMode.normalized == .dictate {
-            return self.settings.isAppDictationPromptBindingActive(
-                for: self.activeDictationShortcutSlot,
-                appBundleID: self.promptResolutionBundleID
-            )
+            return self.dictationPresentation.hasAppOverride
         }
         return self.settings.hasAppPromptBinding(
             for: activePromptMode,
@@ -617,10 +687,7 @@ struct NotchExpandedView: View {
     private var selectedPromptLabel: String {
         guard let activePromptMode else { return "N/A" }
         if activePromptMode.normalized == .dictate {
-            return self.settings.dictationPromptDisplayName(
-                for: self.activeDictationShortcutSlot,
-                appBundleID: self.promptResolutionBundleID
-            )
+            return self.contentState.stopSnapshotLabel ?? self.dictationPresentation.label
         }
         if let profile = self.settings.resolvedPromptProfile(
             for: activePromptMode,
@@ -633,9 +700,7 @@ struct NotchExpandedView: View {
     }
 
     private var compactPromptLabel: String {
-        let label = self.selectedPromptLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard label.count > 7 else { return label }
-        return String(label.prefix(7))
+        self.selectedPromptLabel
     }
 
     private var previewMaxHeight: CGFloat {
@@ -647,7 +712,7 @@ struct NotchExpandedView: View {
     }
 
     private var promptSelectorFixedWidth: CGFloat {
-        52
+        self.showsSpokenSendIndicator ? 82 : 100
     }
 
     private var promptMenuWidth: CGFloat {
@@ -722,9 +787,10 @@ struct NotchExpandedView: View {
     }
 
     private func restoreRecordingTargetFocus() {
-        let pid = NotchContentState.shared.recordingTargetPID
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if let pid { _ = TypingService.activateApp(pid: pid) }
+        guard let context = NotchContentState.shared.recordingTargetContext else { return }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            _ = await TypingService.prepareTargetForDelivery(context)
         }
     }
 
@@ -756,7 +822,6 @@ struct NotchExpandedView: View {
             )
     }
 
-    @ViewBuilder
     private func promptMenuRow(
         _ title: String,
         rowID: String,
@@ -769,7 +834,7 @@ struct NotchExpandedView: View {
             action()
         }) {
             Text(title)
-                .font(.system(size: 9, weight: isSelected ? .semibold : .medium))
+                .font(.fluidSystem(size: 9, weight: isSelected ? .semibold : .medium))
                 .foregroundStyle(.white.opacity(isSelected ? 0.96 : 0.84))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -789,10 +854,9 @@ struct NotchExpandedView: View {
     private func promptMenuContent() -> some View {
         let promptMode = self.activePromptMode ?? .dictate
         let activeDictationSlot = self.activeDictationShortcutSlot
-        let privateAILocked = promptMode.normalized == .dictate && PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
         return VStack(alignment: .leading, spacing: 2) {
             Text("AI Prompt")
-                .font(.system(size: 8, weight: .semibold))
+                .font(.fluidSystem(size: 8, weight: .semibold))
                 .foregroundStyle(Color.white.opacity(0.42))
                 .padding(.horizontal, 6)
                 .padding(.top, 2)
@@ -800,15 +864,20 @@ struct NotchExpandedView: View {
 
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 2) {
-                    let defaultSelected = promptMode.normalized == .dictate
-                        ? (self.settings.dictationPromptSelection(for: activeDictationSlot) == .default)
-                        : (self.settings.selectedPromptID(for: promptMode) == nil)
+                    let defaultAvailable = promptMode.normalized != .dictate
+                        || DictationProviderRoute.isDictationDefaultAvailable(settings: self.settings, appBundleID: self.promptResolutionBundleID)
+                    let defaultSelected = defaultAvailable && (promptMode.normalized == .dictate
+                        ? (self.settings.resolvedDictationPromptSelection(for: activeDictationSlot, appBundleID: self.promptResolutionBundleID) == .default)
+                        : (self.settings.selectedPromptID(for: promptMode) == nil))
 
                     if promptMode.normalized == .dictate {
                         self.promptMenuRow(
-                            "Off",
+                            "Basic",
                             rowID: "off",
-                            isSelected: self.settings.dictationPromptSelection(for: activeDictationSlot) == .off,
+                            isSelected: {
+                                let selection = self.settings.resolvedDictationPromptSelection(for: activeDictationSlot, appBundleID: self.promptResolutionBundleID)
+                                return selection == .off || (selection == .default && !defaultAvailable)
+                            }(),
                             isEnabled: true
                         ) {
                             self.contentState.onDictationPromptSelectionRequested?(.off)
@@ -817,24 +886,27 @@ struct NotchExpandedView: View {
                         }
                     }
 
-                    if !privateAILocked {
-                        self.promptMenuRow("Default", rowID: "default", isSelected: defaultSelected) {
-                            if promptMode.normalized == .dictate {
-                                self.contentState.onDictationPromptSelectionRequested?(.default)
-                            } else {
-                                self.settings.setSelectedPromptID(nil, for: promptMode)
-                            }
-                            self.restoreRecordingTargetFocus()
-                            self.dismissPromptHoverMenu()
+                    self.promptMenuRow(
+                        SettingsStore.DictationModeLabels.externalDefault,
+                        rowID: "default",
+                        isSelected: defaultSelected,
+                        isEnabled: defaultAvailable
+                    ) {
+                        if promptMode.normalized == .dictate {
+                            self.contentState.onDictationPromptSelectionRequested?(.default)
+                        } else {
+                            self.settings.setSelectedPromptID(nil, for: promptMode)
                         }
+                        self.restoreRecordingTargetFocus()
+                        self.dismissPromptHoverMenu()
                     }
 
                     if promptMode.normalized == .dictate && PrivateFeatures.privateAIProvider {
                         let privateAIAvailable = PrivateAIProviderPromptFormat.isAvailable(settings: self.settings)
                         self.promptMenuRow(
-                            PrivateAIProviderFeature.displayName,
+                            SettingsStore.DictationModeLabels.smartWithModel,
                             rowID: PrivateAIProviderFeature.shared.providerID,
-                            isSelected: self.settings.dictationPromptSelection(for: activeDictationSlot) == .privateAI,
+                            isSelected: self.settings.resolvedDictationPromptSelection(for: activeDictationSlot, appBundleID: self.promptResolutionBundleID) == .privateAI,
                             isEnabled: privateAIAvailable
                         ) {
                             self.contentState.onDictationPromptSelectionRequested?(.privateAI)
@@ -843,11 +915,11 @@ struct NotchExpandedView: View {
                         }
                     }
 
-                    let profiles = privateAILocked ? [] : self.settings.promptProfiles(for: promptMode)
+                    let profiles = self.settings.promptProfiles(for: promptMode)
                     if !profiles.isEmpty {
                         ForEach(profiles) { profile in
                             let isSelected = promptMode.normalized == .dictate
-                                ? (self.settings.dictationPromptSelection(for: activeDictationSlot) == .profile(profile.id))
+                                ? (self.settings.resolvedDictationPromptSelection(for: activeDictationSlot, appBundleID: self.promptResolutionBundleID) == .profile(profile.id))
                                 : (self.settings.selectedPromptID(for: promptMode) == profile.id)
                             self.promptMenuRow(
                                 profile.name.isEmpty ? "Untitled" : profile.name,
@@ -886,17 +958,19 @@ struct NotchExpandedView: View {
         if self.presentationPolicy.showsPromptSelector {
             HStack(spacing: 3) {
                 Text(self.compactPromptLabel)
-                    .font(.system(size: 9, weight: .medium))
+                    .help(self.selectedPromptLabel)
+                    .accessibilityLabel(self.selectedPromptLabel)
+                    .font(.fluidSystem(size: 9, weight: .medium))
                     .foregroundStyle(self.isHoveringPromptChip ? .white.opacity(0.94) : .white.opacity(0.86))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .fixedSize(horizontal: true, vertical: false)
+                    .fixedSize(horizontal: false, vertical: false)
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(.fluidSystem(size: 8, weight: .bold))
                     .foregroundStyle(self.isHoveringPromptChip ? .white.opacity(0.78) : .white.opacity(0.62))
                 if self.isAppPromptOverrideActive {
                     Text("App")
-                        .font(.system(size: 8, weight: .semibold))
+                        .font(.fluidSystem(size: 8, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.82))
                         .padding(.horizontal, 3)
                         .padding(.vertical, 1)
@@ -909,21 +983,7 @@ struct NotchExpandedView: View {
             .padding(.horizontal, 5)
             .padding(.vertical, 3)
             .frame(width: self.promptSelectorFixedWidth, alignment: .leading)
-            .background(
-                Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.black.opacity(self.isHoveringPromptChip ? 0.96 : 0.92),
-                                Color(white: self.isHoveringPromptChip ? 0.10 : 0.06),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-            )
-            .shadow(color: .black.opacity(0.28), radius: 8, x: 0, y: 4)
-            .shadow(color: .white.opacity(self.isHoveringPromptChip ? 0.06 : 0.03), radius: 0, x: 0, y: 1)
+            .fluidDropdownSurface()
             .opacity(self.isPromptSelectableMode ? (self.contentState.isProcessing ? 0.7 : 1.0) : 0.6)
             .allowsHitTesting(self.isPromptSelectableMode && !self.contentState.isProcessing)
             .onHover { hovering in
@@ -1020,10 +1080,56 @@ struct NotchExpandedView: View {
 
             self.promptHoverMenuRow
 
-            if self.contentState.isAIProcessingFailureVisible && !self.contentState.isProcessing {
+            if self.contentState.isTextDeliveryFailureVisible && !self.contentState.isProcessing {
+                HStack(spacing: 6) {
+                    Text(self.contentState.textDeliveryFailureMessage)
+                        .font(.fluidSystem(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.orange.opacity(0.9))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    Spacer(minLength: 2)
+
+                    Button {
+                        _ = ClipboardService.copyToClipboard(self.contentState.textDeliveryFailureTranscript)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.fluidSystem(size: 9, weight: .bold))
+                            .frame(width: 16, height: 16)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy transcript")
+
+                    Button {
+                        let transcript = self.contentState.textDeliveryFailureTranscript
+                        self.contentState.clearTextDeliveryFailure()
+                        self.contentState.onRetryTextDeliveryRequested?(transcript)
+                    } label: {
+                        Image(systemName: "arrow.down.doc")
+                            .font(.fluidSystem(size: 9, weight: .bold))
+                            .frame(width: 16, height: 16)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Paste last transcript")
+
+                    Button {
+                        self.contentState.clearTextDeliveryFailure()
+                        NotchOverlayManager.shared.hide()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.fluidSystem(size: 9, weight: .bold))
+                            .frame(width: 16, height: 16)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: self.previewMaxWidth, alignment: .leading)
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            } else if self.contentState.isAIProcessingFailureVisible && !self.contentState.isProcessing {
                 HStack(spacing: 6) {
                     Text(self.contentState.aiProcessingFailureMessage)
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.fluidSystem(size: 10, weight: .semibold))
                         .foregroundStyle(
                             self.contentState.canRetryAIProcessingFailure
                                 ? Color.white.opacity(0.82)
@@ -1040,11 +1146,21 @@ struct NotchExpandedView: View {
                             self.contentState.onReprocessLastRequested?()
                         } label: {
                             Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 9, weight: .bold))
+                                .font(.fluidSystem(size: 9, weight: .bold))
                                 .frame(width: 16, height: 16)
                         }
                         .buttonStyle(.plain)
                         .help("Try again")
+                    }
+
+                    if let download = self.contentState.aiProcessingFailureDownloadAction {
+                        Button("Download") {
+                            self.contentState.clearAIProcessingFailure()
+                            NotchOverlayManager.shared.hide()
+                            download()
+                        }
+                        .font(.fluidSystem(size: 10, weight: .bold))
+                        .buttonStyle(.plain)
                     }
 
                     Button {
@@ -1052,7 +1168,7 @@ struct NotchExpandedView: View {
                         NotchOverlayManager.shared.hide()
                     } label: {
                         Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.fluidSystem(size: 9, weight: .bold))
                             .frame(width: 16, height: 16)
                     }
                     .buttonStyle(.plain)
@@ -1064,36 +1180,20 @@ struct NotchExpandedView: View {
             } else if self.presentationPolicy.showsStreamingPreview && self.hasTranscription && !self.contentState.isProcessing {
                 let previewText = self.visiblePreviewText
                 if !previewText.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: false) {
-                            Text(previewText)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.75))
-                                .multilineTextAlignment(.leading)
-                                .lineLimit(nil)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
-                        .frame(width: self.previewMaxWidth, alignment: .leading)
-                        .frame(maxHeight: self.previewMaxHeight, alignment: .leading)
-                        .clipped()
-                        .onAppear {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: previewText) { _, _ in
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                    }
+                    OverlayCaptionView(
+                        caption: self.contentState.captionPreview,
+                        context: self.contentState.captionContext,
+                        fontSize: 10,
+                        maxHeight: self.previewMaxHeight,
+                        opacity: 0.75
+                    )
+                    .frame(width: self.previewMaxWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 }
             }
         }
+        .onAppear { self.promptPresentation.start() }
         .coordinateSpace(name: Self.notchContentCoordinateSpace)
         .frame(width: self.notchContentWidth)
         .padding(.horizontal, 6)
@@ -1187,7 +1287,6 @@ struct NotchWaveformView: View {
         }
     }
 
-    @ViewBuilder
     private func barsView(using height: @escaping (Int) -> CGFloat) -> some View {
         HStack(spacing: self.barSpacing) {
             ForEach(0..<self.barCount, id: \.self) { index in
@@ -1332,13 +1431,17 @@ struct NotchCompactBottomView: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
-            Text(self.compactPreviewText)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.white.opacity(0.82))
-                .lineLimit(1)
-                .truncationMode(.head)
-                .offset(y: self.shouldShowPreview ? 0 : -4)
-                .opacity(self.shouldShowPreview ? 1 : 0)
+            OverlayCaptionView(
+                caption: self.contentState.captionPreview,
+                context: self.contentState.captionContext,
+                fontSize: 9,
+                maxHeight: self.previewHeight,
+                opacity: 0.82,
+                maxLines: 1,
+                isActive: self.shouldShowPreview
+            )
+            .offset(y: self.shouldShowPreview ? 0 : -4)
+            .opacity(self.shouldShowPreview ? 1 : 0)
         }
         .frame(width: self.previewWidth, height: SettingsStore.shared.enableStreamingPreview ? self.previewHeight : 0, alignment: .leading)
         .padding(.horizontal, SettingsStore.shared.enableStreamingPreview ? 10 : 0)
@@ -1353,7 +1456,7 @@ struct NotchCompactBottomView: View {
 struct NotchCommandOutputExpandedView: View {
     let audioPublisher: AnyPublisher<CGFloat, Never>
     let onDismiss: () -> Void
-    let onSubmit: (String) async -> Void
+    let onSubmit: (String) async -> Bool
     let onNewChat: () -> Void
     let onSwitchChat: (String) -> Void
     let onClearChat: () -> Void
@@ -1363,6 +1466,7 @@ struct NotchCommandOutputExpandedView: View {
     @State private var inputText: String = ""
     @FocusState private var isInputFocused: Bool
     @State private var scrollProxy: ScrollViewProxy?
+    @State private var pendingScrollWorkItem: DispatchWorkItem?
     @State private var isHoveringNewChat = false
     @State private var isHoveringRecent = false
     @State private var isHoveringClear = false
@@ -1378,8 +1482,12 @@ struct NotchCommandOutputExpandedView: View {
     private var dynamicHeight: CGFloat {
         let baseHeight: CGFloat = 120 // Minimum height
         let contentHeight = self.estimateContentHeight()
+        // Reserve the caption's full height while recording so its wrapped lines
+        // cannot squeeze the header and follow-up input out of the window.
+        let captionHeight = self.contentState.isRecordingInExpandedMode && !self.contentState.cachedPreviewText.isEmpty
+            ? self.previewMaxHeight + 12 : 0
         let maxHeight = (NSScreen.main?.frame.height ?? 800) * 0.45 // 45% of screen
-        return min(max(baseHeight, contentHeight), maxHeight)
+        return min(max(baseHeight, contentHeight) + captionHeight, maxHeight)
     }
 
     private func estimateContentHeight() -> CGFloat {
@@ -1450,13 +1558,13 @@ struct NotchCommandOutputExpandedView: View {
                 // Mode label
                 if self.contentState.isRecordingInExpandedMode {
                     Text("Listening...")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.fluidSystem(size: 11, weight: .medium))
                         .foregroundStyle(self.commandRed)
                 } else if self.contentState.isCommandProcessing {
                     ShimmerText(text: "Working...", color: self.commandRed)
                 } else {
                     Text("Command")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.fluidSystem(size: 11, weight: .medium))
                         .foregroundStyle(self.commandRed.opacity(0.7))
                 }
             }
@@ -1472,7 +1580,7 @@ struct NotchCommandOutputExpandedView: View {
                             .fill(self.isHoveringNewChat ? self.commandRed.opacity(0.25) : self.commandRed.opacity(0.12))
                             .frame(width: 22, height: 22)
                         Image(systemName: "plus")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.fluidSystem(size: 10, weight: .semibold))
                             .foregroundStyle(self.contentState.isCommandProcessing ? .white.opacity(0.3) : self.commandRed.opacity(0.85))
                     }
                 }
@@ -1499,13 +1607,13 @@ struct NotchCommandOutputExpandedView: View {
                                 HStack {
                                     if chat.id == currentID {
                                         Image(systemName: "checkmark")
-                                            .font(.caption)
+                                            .font(.fluidSystem(.caption))
                                     }
                                     Text(chat.title)
                                         .lineLimit(1)
                                     Spacer()
                                     Text(chat.relativeTimeString)
-                                        .font(.caption)
+                                        .font(.fluidSystem(.caption))
                                         .foregroundStyle(.secondary)
                                 }
                             }
@@ -1518,7 +1626,7 @@ struct NotchCommandOutputExpandedView: View {
                             .fill(self.isHoveringRecent ? self.commandRed.opacity(0.25) : self.commandRed.opacity(0.12))
                             .frame(width: 22, height: 22)
                         Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 9, weight: .semibold))
+                            .font(.fluidSystem(size: 9, weight: .semibold))
                             .foregroundStyle(self.commandRed.opacity(0.85))
                     }
                 }
@@ -1536,7 +1644,7 @@ struct NotchCommandOutputExpandedView: View {
                             .fill(self.isHoveringClear ? self.commandRed.opacity(0.25) : self.commandRed.opacity(0.12))
                             .frame(width: 22, height: 22)
                         Image(systemName: "trash")
-                            .font(.system(size: 9, weight: .semibold))
+                            .font(.fluidSystem(size: 9, weight: .semibold))
                             .foregroundStyle(self.contentState.isCommandProcessing ? .white.opacity(0.3) : self.commandRed.opacity(0.85))
                     }
                 }
@@ -1559,7 +1667,7 @@ struct NotchCommandOutputExpandedView: View {
                             .fill(self.isHoveringDismiss ? self.commandRed.opacity(0.25) : self.commandRed.opacity(0.12))
                             .frame(width: 22, height: 22)
                         Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.fluidSystem(size: 9, weight: .bold))
                             .foregroundStyle(self.commandRed.opacity(0.85))
                     }
                 }
@@ -1583,30 +1691,14 @@ struct NotchCommandOutputExpandedView: View {
             if self.contentState.isRecordingInExpandedMode && !self.contentState.transcriptionText.isEmpty {
                 let previewText = self.contentState.cachedPreviewText
                 if !previewText.isEmpty {
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical, showsIndicators: false) {
-                            Text(previewText)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.75))
-                                .multilineTextAlignment(.leading)
-                                .lineLimit(nil)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: self.previewMaxHeight)
-                        .clipped()
-                        .onAppear {
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: previewText) { _, _ in
-                            DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                            }
-                        }
-                    }
+                    OverlayCaptionView(
+                        caption: self.contentState.captionPreview,
+                        context: self.contentState.captionContext,
+                        fontSize: 11,
+                        maxHeight: self.previewMaxHeight,
+                        opacity: 0.75
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(self.commandRed.opacity(0.1))
@@ -1615,7 +1707,6 @@ struct NotchCommandOutputExpandedView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: self.contentState.isRecordingInExpandedMode)
-        .animation(.easeInOut(duration: 0.15), value: self.contentState.transcriptionText)
     }
 
     // MARK: - Conversation Area
@@ -1651,6 +1742,11 @@ struct NotchCommandOutputExpandedView: View {
                 // Always scroll to bottom when view appears
                 self.scrollToBottom(proxy, animated: false)
             }
+            .onDisappear {
+                self.pendingScrollWorkItem?.cancel()
+                self.pendingScrollWorkItem = nil
+                self.scrollProxy = nil
+            }
             .onChange(of: self.contentState.commandConversationHistory.count) { _, _ in
                 self.scrollToBottom(proxy, animated: true)
             }
@@ -1666,7 +1762,10 @@ struct NotchCommandOutputExpandedView: View {
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        guard self.pendingScrollWorkItem == nil else { return }
+        let work = DispatchWorkItem {
+            self.pendingScrollWorkItem = nil
+            guard self.scrollProxy != nil else { return }
             if animated {
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -1675,6 +1774,8 @@ struct NotchCommandOutputExpandedView: View {
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
+        self.pendingScrollWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
     // MARK: - Message Views
@@ -1685,7 +1786,7 @@ struct NotchCommandOutputExpandedView: View {
             case .user:
                 Spacer()
                 Text(message.content)
-                    .font(.system(size: 11))
+                    .font(.fluidSystem(size: 11))
                     .foregroundStyle(.white.opacity(0.9))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
@@ -1696,7 +1797,7 @@ struct NotchCommandOutputExpandedView: View {
 
             case .assistant:
                 Text(message.content)
-                    .font(.system(size: 11))
+                    .font(.fluidSystem(size: 11))
                     .foregroundStyle(.white.opacity(0.85))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
@@ -1712,7 +1813,7 @@ struct NotchCommandOutputExpandedView: View {
                         .fill(self.commandRed.opacity(0.6))
                         .frame(width: 4, height: 4)
                     Text(message.content)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.fluidSystem(size: 10, weight: .medium))
                         .foregroundStyle(.white.opacity(0.5))
                 }
                 .padding(.vertical, 2)
@@ -1724,7 +1825,7 @@ struct NotchCommandOutputExpandedView: View {
     private var streamingMessageView: some View {
         HStack(alignment: .top) {
             Text(self.contentState.commandStreamingText)
-                .font(.system(size: 11))
+                .font(.fluidSystem(size: 11))
                 .foregroundStyle(.white.opacity(0.85))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
@@ -1763,7 +1864,7 @@ struct NotchCommandOutputExpandedView: View {
         HStack(spacing: 8) {
             TextField("Ask follow-up...", text: self.$inputText)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11))
+                .font(.fluidSystem(size: 11))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
@@ -1776,7 +1877,7 @@ struct NotchCommandOutputExpandedView: View {
 
             Button(action: self.submitFollowUp) {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 16))
+                    .font(.fluidSystem(size: 16))
                     .foregroundStyle(self.inputText.isEmpty ? .white.opacity(0.3) : self.commandRed)
             }
             .buttonStyle(.plain)
@@ -1790,10 +1891,11 @@ struct NotchCommandOutputExpandedView: View {
     private func submitFollowUp() {
         guard !self.inputText.isEmpty else { return }
         let text = self.inputText
-        self.inputText = ""
 
         Task {
-            await self.onSubmit(text)
+            if await self.onSubmit(text), self.inputText == text {
+                self.inputText = ""
+            }
         }
     }
 }
@@ -1881,19 +1983,23 @@ struct CompactNotchWaveformView: View {
 
     var body: some View {
         ZStack {
-            self.barsView(using: { index in
-                self.displayHeight(for: index)
-            })
-            .foregroundStyle(self.color.opacity(self.contentState.isProcessing ? 0.16 : 1.0))
+            if self.contentState.isDictationMuted {
+                DictationMutedIndicator(compact: true)
+            } else {
+                self.barsView(using: { index in
+                    self.displayHeight(for: index)
+                })
+                .foregroundStyle(self.color.opacity(self.contentState.isProcessing ? 0.16 : 1.0))
 
-            if self.contentState.isProcessing {
-                CompositorShimmerSweep(duration: 1.05, peakOpacity: 0.9)
-                    .mask {
-                        self.barsView(using: { index in
-                            self.displayHeight(for: index)
-                        })
-                    }
-                    .shadow(color: .white.opacity(0.28), radius: 2.5, x: 0, y: 0)
+                if self.contentState.isProcessing {
+                    CompositorShimmerSweep(duration: 1.05, peakOpacity: 0.9)
+                        .mask {
+                            self.barsView(using: { index in
+                                self.displayHeight(for: index)
+                            })
+                        }
+                        .shadow(color: .white.opacity(0.28), radius: 2.5, x: 0, y: 0)
+                }
             }
         }
         .onChange(of: self.data.audioLevel) { _, level in
@@ -1917,7 +2023,6 @@ struct CompactNotchWaveformView: View {
         }
     }
 
-    @ViewBuilder
     private func barsView(using height: @escaping (Int) -> CGFloat) -> some View {
         HStack(spacing: self.barSpacing) {
             ForEach(0..<self.barCount, id: \.self) { index in

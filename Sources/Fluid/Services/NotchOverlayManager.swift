@@ -49,7 +49,6 @@ final class NotchOverlayManager {
         EmptyView
     >?
     private var currentMode: OverlayMode = .dictation
-
     /// Store last audio publisher for re-showing during processing
     private var lastAudioPublisher: AnyPublisher<CGFloat, Never>?
 
@@ -69,6 +68,7 @@ final class NotchOverlayManager {
 
     /// Track if expanded command output is showing
     private(set) var isCommandOutputExpanded: Bool = false
+    var hasCommandOutputToDismiss: Bool { self.isCommandOutputExpanded || self.commandOutputPresentationTask != nil }
 
     /// Track if bottom overlay is visible
     private(set) var isBottomOverlayVisible: Bool = false
@@ -76,7 +76,7 @@ final class NotchOverlayManager {
 
     // Callbacks for command output interaction
     var onCommandOutputDismiss: (() -> Void)?
-    var onCommandFollowUp: ((String) async -> Void)?
+    var onCommandFollowUp: ((String) async -> Bool)?
     var onNotchClicked: (() -> Void)? // Called when regular notch is clicked in command mode
 
     // Callbacks for chat management
@@ -93,6 +93,7 @@ final class NotchOverlayManager {
     private var hideWaiters: [CheckedContinuation<RecordingOverlayHideOutcome, Never>] = []
     private var notchAnimationTask: Task<Void, Never>?
     private var notchPresentationTask: Task<Void, Never>?
+    private var commandOutputPresentationTask: Task<Void, Never>?
 
     // Cancel shortcut monitors for dismissing notch / overlay
     private var globalEscapeMonitor: Any?
@@ -131,10 +132,10 @@ final class NotchOverlayManager {
     /// Setup cancel shortcut monitors - both global (other apps) and local (our app)
     private func setupEscapeKeyMonitors() {
         let escapeHandler: (NSEvent) -> NSEvent? = { [weak self] event in
-            guard SettingsStore.shared.cancelRecordingHotkeyShortcut.matches(
+            guard SettingsStore.shared.cancelRecordingHotkeyShortcut?.matches(
                 keyCode: event.keyCode,
                 modifiers: event.modifierFlags
-            ) else { return event }
+            ) == true else { return event }
 
             Task { @MainActor in
                 guard self != nil else { return }
@@ -150,6 +151,9 @@ final class NotchOverlayManager {
     }
 
     func show(audioLevelPublisher: AnyPublisher<CGFloat, Never>, mode: OverlayMode) {
+        // A new recording supersedes output that has not appeared yet.
+        self.commandOutputPresentationTask?.cancel()
+        self.commandOutputPresentationTask = nil
         self.refreshNotchPresentationPolicy()
         Self.overlayBench("show_called mode=\(mode.rawValue) state=\(self.state) commandExpanded=\(self.isCommandOutputExpanded)")
         self.cancelInFlightHideForNewPresentation()
@@ -311,11 +315,18 @@ final class NotchOverlayManager {
     }
 
     func hide() {
+        guard SettingsStore.shared.overlayClosingAnimationEnabled else {
+            self.hideImmediately()
+            return
+        }
         guard !self.isHideInProgress else { return }
         self.isHideInProgress = true
         self.generation &+= 1
         let currentGeneration = self.generation
         self.activeHideGeneration = currentGeneration
+        if self.isBottomOverlayVisible {
+            BottomOverlayWindowController.shared.hide()
+        }
         Task { [weak self] in
             guard let self else { return }
             let outcome = await self.performHideAndWait(generation: currentGeneration)
@@ -323,9 +334,69 @@ final class NotchOverlayManager {
         }
     }
 
+    /// Freezes overlay animation for the latency-critical stop path.
+    func freezeForStop() {
+        guard self.isBottomOverlayVisible else { return }
+        BottomOverlayWindowController.shared.freezeForStop()
+    }
+
+    /// Removes a successfully completed recording overlay synchronously so it
+    /// cannot outlive the text insertion that follows.
+    func hideImmediately() {
+        var trace = OverlayCloseTrace("manager.hide")
+        defer { trace.finish() }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.generation &+= 1
+        let currentGeneration = self.generation
+
+        self.activeHideGeneration = nil
+        self.isHideInProgress = false
+        let waiters = self.hideWaiters
+        self.hideWaiters.removeAll(keepingCapacity: true)
+
+        if self.isBottomOverlayVisible {
+            BottomOverlayWindowController.shared.hideImmediately()
+            self.isBottomOverlayVisible = false
+        }
+
+        if self.notch != nil || self.state != .idle {
+            self.retireCurrentNotchImmediately(reason: "completed_output")
+        }
+        trace.mark("bottomAndNotchRemoved")
+
+        waiters.forEach { $0.resume(returning: .hidden) }
+        Self.overlayBench("hide_immediate_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
+
+        // Runs after the hide transaction is committed so state churn cannot
+        // delay the panel leaving the screen.
+        CATransaction.setCompletionBlock { [weak self] in
+            MainActor.assumeIsolated {
+                var cleanupTrace = OverlayCloseTrace("manager.postCommitCleanup")
+                cleanupTrace.mark("commitDelay", since: startedAt)
+                defer { cleanupTrace.finish() }
+                guard let self, self.generation == currentGeneration else { return }
+                ActiveAppMonitor.shared.stopMonitoring()
+                cleanupTrace.mark("stopMonitoring")
+                if NotchContentState.shared.isProcessing {
+                    NotchContentState.shared.setProcessing(false)
+                }
+                cleanupTrace.mark("processingFalse")
+                NotchContentState.shared.updateTranscription("")
+                cleanupTrace.mark("clearTranscription")
+                NotchContentState.shared.setSpokenSendIndicatorState(.hidden)
+                cleanupTrace.mark("clearIndicator")
+                Self.overlayBench("hide_immediate_cleanup_complete")
+            }
+        }
+    }
+
     /// Reports whether the active overlay finished hiding or a newer
     /// presentation superseded this request.
     func hideAndWait() async -> RecordingOverlayHideOutcome {
+        guard SettingsStore.shared.overlayClosingAnimationEnabled else {
+            self.hideImmediately()
+            return .hidden
+        }
         if self.isHideInProgress {
             return await withCheckedContinuation { continuation in
                 self.hideWaiters.append(continuation)
@@ -351,10 +422,12 @@ final class NotchOverlayManager {
 
         // Stop monitoring active app changes
         ActiveAppMonitor.shared.stopMonitoring()
+        DebugLogger.shared.debug("HIDE_TRACE phase=monitor_stopped elapsedUs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000_000))", source: "StopTiming")
 
         // Hide bottom overlay if visible
         if self.isBottomOverlayVisible {
             let bottomOutcome = await BottomOverlayWindowController.shared.hideAndWait()
+            DebugLogger.shared.debug("HIDE_TRACE phase=bottom_returned elapsedUs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000_000))", source: "StopTiming")
             guard bottomOutcome == .hidden else {
                 Self.overlayBench("hide_return reason=bottom_superseded")
                 return .superseded
@@ -496,8 +569,8 @@ final class NotchOverlayManager {
         }
     }
 
-    private static func overlayBench(_ message: String) {
-        DebugLogger.shared.benchmark("OVERLAY_BENCH", message: "notch \(message)", source: "OverlayBenchmark")
+    private static func overlayBench(_ message: @autoclosure () -> String) {
+        DebugLogger.shared.benchmark("OVERLAY_BENCH", message: "notch \(message())", source: "OverlayBenchmark")
     }
 
     private static func elapsedMs(since start: TimeInterval) -> Int {
@@ -510,19 +583,26 @@ final class NotchOverlayManager {
     func showExpandedCommandOutput() {
         guard self.canShowExpandedCommandOutput else { return }
 
+        self.commandOutputPresentationTask?.cancel()
+
         // Hide regular notch first if visible
         if self.notch != nil {
             self.hide()
         }
 
         // Wait a bit for cleanup
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            await self?.showExpandedCommandOutputInternal()
+        self.commandOutputPresentationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.commandOutputPresentationTask = nil
+            await self.showExpandedCommandOutputInternal()
         }
     }
 
     private func showExpandedCommandOutputInternal() async {
+        guard !Task.isCancelled else { return }
         guard self.canShowExpandedCommandOutput else { return }
         guard self.commandOutputState == .idle else { return }
 
@@ -551,8 +631,8 @@ final class NotchOverlayManager {
                     }
                 },
                 onSubmit: { [weak self] text in
-                    guard let self, self.allowsCommandNotchActions else { return }
-                    await self.onCommandFollowUp?(text)
+                    guard let self, self.allowsCommandNotchActions else { return false }
+                    return await self.onCommandFollowUp?(text) ?? false
                 },
                 onNewChat: { [weak self] in
                     Task { @MainActor in
@@ -619,6 +699,8 @@ final class NotchOverlayManager {
 
     /// Hide expanded command output notch - force close regardless of hover state
     func hideExpandedCommandOutput() {
+        self.commandOutputPresentationTask?.cancel()
+        self.commandOutputPresentationTask = nil
         self.commandOutputGeneration &+= 1
         let currentGeneration = self.commandOutputGeneration
 
@@ -649,7 +731,7 @@ final class NotchOverlayManager {
 
     /// Toggle expanded command output (for hotkey handling)
     func toggleExpandedCommandOutput() {
-        if self.isCommandOutputExpanded {
+        if self.hasCommandOutputToDismiss {
             self.hideExpandedCommandOutput()
         } else if self.canShowExpandedCommandOutput,
                   NotchContentState.shared.commandConversationHistory.isEmpty == false

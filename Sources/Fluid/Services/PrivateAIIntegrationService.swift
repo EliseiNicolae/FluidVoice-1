@@ -1,190 +1,8 @@
 import Foundation
 
-enum PrivateAIMLXUpgradeCoordinator {
-    private static let offerVersion = "1.6.3"
-    private static let offerHandledKey = "FluidIntelligenceMLXUpgrade163OfferHandled"
-    private static let offerPreparedKey = "FluidIntelligenceMLXUpgrade163OfferPrepared"
-    private static let upgradePendingKey = "FluidIntelligenceMLXUpgrade163Pending"
-    private static let previousVerificationKey = "FluidIntelligenceMLXUpgrade163PreviousVerification"
-    private static let legacyLlamaFilenames = ["fluid-1-q4_k_m.gguf", "Fluid-1-Q4_K_M.gguf"]
-
-    static func prepareOfferIfNeeded(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard,
-        modelDirectoryURL: URL = PrivateAIIntegrationService.modelDirectoryURL,
-        isAppleSilicon: Bool = CPUArchitecture.isAppleSilicon,
-        appVersion: String = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? ""
-    ) -> Bool {
-        if defaults.bool(forKey: self.upgradePendingKey) {
-            self.restorePreviousLlama(settings: settings, defaults: defaults)
-            return false
-        }
-
-        guard appVersion == self.offerVersion else {
-            defaults.set(false, forKey: self.offerPreparedKey)
-            return false
-        }
-
-        if defaults.bool(forKey: self.offerPreparedKey),
-           !defaults.bool(forKey: self.offerHandledKey)
-        {
-            let rawBackend = defaults.string(forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey)
-            guard self.shouldResumePreparedOffer(
-                hasPrivateProvider: PrivateFeatures.privateAIProvider,
-                isAppleSilicon: isAppleSilicon,
-                appVersion: appVersion,
-                backendPreference: rawBackend.flatMap(SettingsStore.PrivateAIBackendPreference.init(rawValue:)),
-                hasLegacyLlamaModel: self.hasLegacyLlamaModel(in: modelDirectoryURL),
-                hasMLXModel: PrivateAIIntegrationService.hasInactiveInstalledModel(
-                    keeping: PrivateAIModelRegistry.defaultModel
-                )
-            ) else {
-                defaults.set(false, forKey: self.offerPreparedKey)
-                return false
-            }
-
-            settings.privateAIBackendPreference = .llama
-            self.migrateLegacyVerificationToLlama(settings: settings)
-            return true
-        }
-
-        guard self.shouldOffer(
-            hasPrivateProvider: PrivateFeatures.privateAIProvider,
-            isAppleSilicon: isAppleSilicon,
-            appVersion: appVersion,
-            backendPreferenceWasSet: defaults.object(
-                forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey
-            ) != nil,
-            hasLegacyLlamaModel: self.hasLegacyLlamaModel(in: modelDirectoryURL),
-            hasMLXModel: PrivateAIIntegrationService.isModelInstalled(PrivateAIModelRegistry.defaultModel),
-            offerWasHandled: defaults.bool(forKey: self.offerHandledKey)
-        ) else {
-            return false
-        }
-
-        settings.privateAIBackendPreference = .llama
-        self.migrateLegacyVerificationToLlama(settings: settings)
-        defaults.set(true, forKey: self.offerPreparedKey)
-        return true
-    }
-
-    static func beginUpgrade(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard
-    ) {
-        let key = self.privateProviderKey
-        if let verification = settings.verifiedProviderFingerprints[key] {
-            defaults.set(verification, forKey: self.previousVerificationKey)
-        } else {
-            defaults.removeObject(forKey: self.previousVerificationKey)
-        }
-
-        defaults.set(true, forKey: self.offerHandledKey)
-        defaults.set(false, forKey: self.offerPreparedKey)
-        defaults.set(true, forKey: self.upgradePendingKey)
-        settings.privateAIBackendPreference = .mlx
-        settings.verifiedProviderFingerprints.removeValue(forKey: key)
-        defaults.removeObject(forKey: PrivateAIIntegrationService.localModelPathDefaultsKey)
-    }
-
-    static func keepCurrentModel(defaults: UserDefaults = .standard) {
-        defaults.set(true, forKey: self.offerHandledKey)
-        defaults.set(false, forKey: self.offerPreparedKey)
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-    }
-
-    static func completeUpgrade(defaults: UserDefaults = .standard) {
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-    }
-
-    static func restorePreviousLlama(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard
-    ) {
-        settings.privateAIBackendPreference = .llama
-        var fingerprints = settings.verifiedProviderFingerprints
-        if let verification = defaults.string(forKey: self.previousVerificationKey), !verification.isEmpty {
-            fingerprints[self.privateProviderKey] = verification
-        } else {
-            fingerprints.removeValue(forKey: self.privateProviderKey)
-        }
-        settings.verifiedProviderFingerprints = fingerprints
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-        defaults.removeObject(forKey: PrivateAIIntegrationService.localModelPathDefaultsKey)
-    }
-
-    static func isUpgradePending(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: self.upgradePendingKey)
-    }
-
-    static func shouldOffer(
-        hasPrivateProvider: Bool,
-        isAppleSilicon: Bool,
-        appVersion: String,
-        backendPreferenceWasSet: Bool,
-        hasLegacyLlamaModel: Bool,
-        hasMLXModel: Bool,
-        offerWasHandled: Bool
-    ) -> Bool {
-        hasPrivateProvider &&
-            isAppleSilicon &&
-            appVersion == self.offerVersion &&
-            !backendPreferenceWasSet &&
-            hasLegacyLlamaModel &&
-            !hasMLXModel &&
-            !offerWasHandled
-    }
-
-    static func shouldResumePreparedOffer(
-        hasPrivateProvider: Bool,
-        isAppleSilicon: Bool,
-        appVersion: String,
-        backendPreference: SettingsStore.PrivateAIBackendPreference?,
-        hasLegacyLlamaModel: Bool,
-        hasMLXModel: Bool
-    ) -> Bool {
-        hasPrivateProvider &&
-            isAppleSilicon &&
-            appVersion == self.offerVersion &&
-            backendPreference == .llama &&
-            hasLegacyLlamaModel &&
-            !hasMLXModel
-    }
-
-    private static var privateProviderKey: String {
-        let providerID = PrivateAIProviderFeature.shared.providerID
-        if ModelRepository.shared.isBuiltIn(providerID) || providerID.hasPrefix("custom:") {
-            return providerID
-        }
-        return "custom:\(providerID)"
-    }
-
-    private static func hasLegacyLlamaModel(in directoryURL: URL) -> Bool {
-        self.legacyLlamaFilenames.contains {
-            FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent($0).path)
-        }
-    }
-
-    private static func migrateLegacyVerificationToLlama(settings: SettingsStore) {
-        let key = self.privateProviderKey
-        let legacyFingerprint = "private-ai-provider|\(PrivateAIProviderFeature.shared.defaultModelID)"
-        guard settings.verifiedProviderFingerprints[key] == legacyFingerprint else { return }
-
-        var fingerprints = settings.verifiedProviderFingerprints
-        fingerprints[key] = PrivateAIProviderFeature.verificationFingerprint(
-            for: PrivateAIProviderFeature.shared.defaultModelID
-        )
-        settings.verifiedProviderFingerprints = fingerprints
-    }
-}
-
 actor PrivateAIIntegrationService {
     static let shared = PrivateAIIntegrationService()
+    private nonisolated let dictationProviderOverride: (any PrivateAIIntegrationProviding)?
 
     static var selectedModelDefaultsKey: String {
         PrivateAIProviderFeature.shared.selectedModelDefaultsKey
@@ -211,12 +29,37 @@ actor PrivateAIIntegrationService {
         let bundleID: String
         let windowTitle: String
         let appVersion: String?
+        /// Raw text for models trained to read it; others ignore both.
+        var textBeforeCursor: String? = nil
+        // Absence means no screen context was read.
+        // swiftlint:disable:next discouraged_optional_collection
+        var screenText: [String]? = nil
+        /// The text an Edit Mode instruction applies to, when any was selected.
+        var selectedText: String? = nil
+        // The front window, for Edit Mode models that read it.
+        // swiftlint:disable:next discouraged_optional_collection
+        var windowLines: [EditModeWindowLine]? = nil
+        /// Signs what Edit Mode writes.
+        var userDisplayName: String? = nil
     }
 
     struct EnhancementResult: Sendable, Equatable {
         let outputText: String
         let backendKind: String?
         let latencyMilliseconds: Int?
+        let tokensPerSecond: Double?
+
+        init(
+            outputText: String,
+            backendKind: String?,
+            latencyMilliseconds: Int?,
+            tokensPerSecond: Double? = nil
+        ) {
+            self.outputText = outputText
+            self.backendKind = backendKind
+            self.latencyMilliseconds = latencyMilliseconds
+            self.tokensPerSecond = tokensPerSecond
+        }
     }
 
     struct LoadedModelState: Sendable, Equatable {
@@ -225,12 +68,44 @@ actor PrivateAIIntegrationService {
         let message: String?
     }
 
-    private init() {}
+    private init() {
+        self.dictationProviderOverride = nil
+    }
+
+    #if DEBUG
+    init(testingProvider: any PrivateAIIntegrationProviding) {
+        self.dictationProviderOverride = testingProvider
+    }
+    #endif
+
+    /// Called only inside the meeting residency scope, after other models are suspended.
+    static func summarizeMeeting(
+        _ transcript: String,
+        style: String,
+        instructions: String = "",
+        thinking: Bool = true
+    ) async throws -> String {
+        guard await MeetingModelResidencyCoordinator.shared.phase == .summary else {
+            throw MeetingModelResidencyError.staleGrant
+        }
+        do {
+            let output = try await provider.summarizeMeeting(transcript, style: style, instructions: instructions, thinking: thinking)
+            await Task { await self.provider.unloadCachedRuntime(reason: "meeting summary complete") }.value
+            return output
+        } catch {
+            await Task { await self.provider.unloadCachedRuntime(reason: "meeting summary ended") }.value
+            throw error
+        }
+    }
 
     private nonisolated static var provider: any PrivateAIIntegrationProviding {
         PrivateAIProviderFeature.shared.isAvailable
             ? PrivateAIProviderRegistry.integration
             : UnavailableAIIntegrationShim.shared
+    }
+
+    private nonisolated var dictationProvider: any PrivateAIIntegrationProviding {
+        self.dictationProviderOverride ?? Self.provider
     }
 
     nonisolated static var configuredModelID: String {
@@ -249,6 +124,11 @@ actor PrivateAIIntegrationService {
         provider.modelDirectoryURL
     }
 
+    /// The local model Edit Mode runs on. Dictation's model choice never changes it.
+    nonisolated static var editModel: PrivateAIRegisteredModel? {
+        PrivateAIModelRegistry.modelIDs(for: .edit).first.flatMap { PrivateAIModelRegistry.model(id: $0) }
+    }
+
     nonisolated static func expectedLocalModelURL(for model: PrivateAIRegisteredModel) -> URL {
         self.provider.expectedLocalModelURL(for: model)
     }
@@ -257,8 +137,38 @@ actor PrivateAIIntegrationService {
         self.provider.localModelPath(for: model)
     }
 
-    nonisolated static func isModelInstalled(_ model: PrivateAIRegisteredModel) -> Bool {
-        self.provider.isModelInstalled(model)
+    // Installation checks walk the model directory. SwiftUI bodies ask several
+    // times per frame, so serve a briefly cached answer instead of hitting disk.
+    private nonisolated static let installedModelCacheLock = NSLock()
+    private nonisolated(unsafe) static var installedModelCache: [String: (installed: Bool, checkedAt: TimeInterval)] = [:]
+    private nonisolated static let installedModelCacheLifetime: TimeInterval = 2
+
+    nonisolated static func isModelInstalled(_ model: PrivateAIRegisteredModel, useCache: Bool = true) -> Bool {
+        // Event-driven presentation refreshes must see removals even when an
+        // older, concurrent check populated the short-lived runtime cache.
+        if !useCache { return self.provider.isModelInstalled(model) }
+        let now = ProcessInfo.processInfo.systemUptime
+        self.installedModelCacheLock.lock()
+        let cached = self.installedModelCache[model.id]
+        self.installedModelCacheLock.unlock()
+        if let cached, now - cached.checkedAt < self.installedModelCacheLifetime {
+            return cached.installed
+        }
+
+        let installed = self.provider.isModelInstalled(model)
+        self.installedModelCacheLock.lock()
+        self.installedModelCache[model.id] = (installed, now)
+        self.installedModelCacheLock.unlock()
+        return installed
+    }
+
+    nonisolated static let installedModelsDidChangeNotification = Notification.Name("PrivateAIInstalledModelsDidChange")
+
+    nonisolated static func invalidateInstalledModelCache() {
+        self.installedModelCacheLock.lock()
+        self.installedModelCache.removeAll()
+        self.installedModelCacheLock.unlock()
+        NotificationCenter.default.post(name: self.installedModelsDidChangeNotification, object: nil)
     }
 
     nonisolated static func canRemoveInstalledModel(_ model: PrivateAIRegisteredModel) -> Bool {
@@ -273,6 +183,7 @@ actor PrivateAIIntegrationService {
     }
 
     nonisolated static func removeInstalledModel(_ model: PrivateAIRegisteredModel) throws {
+        defer { self.invalidateInstalledModelCache() }
         let requestedURLs = self.provider.installedModelURLs(for: model)
         guard !requestedURLs.isEmpty else { return }
         let targetURLs = try self.validatedModelURLs(requestedURLs)
@@ -280,6 +191,7 @@ actor PrivateAIIntegrationService {
     }
 
     nonisolated static func removeInactiveInstalledModels(keeping model: PrivateAIRegisteredModel) throws {
+        defer { self.invalidateInstalledModelCache() }
         let requestedURLs = self.provider.inactiveInstalledModelURLs(keeping: model)
         guard !requestedURLs.isEmpty else { return }
         let targetURLs = try self.validatedModelURLs(requestedURLs)
@@ -290,7 +202,10 @@ actor PrivateAIIntegrationService {
         guard !urls.isEmpty else { return [] }
         let modelDirectoryURL = self.modelDirectoryURL.resolvingSymlinksInPath().standardizedFileURL
         let modelDirectoryPath = modelDirectoryURL.path
-        let targetURLs = Array(Set(urls.map { $0.resolvingSymlinksInPath().standardizedFileURL }))
+        // Preserve provider order: model files precede their installation receipt.
+        var seen = Set<URL>()
+        let targetURLs = urls.map { $0.resolvingSymlinksInPath().standardizedFileURL }
+            .filter { seen.insert($0).inserted }
         guard targetURLs.allSatisfy({ $0.path.hasPrefix(modelDirectoryPath + "/") }) else {
             throw PrivateAIModelRemovalError(message: "A model file is not in FluidVoice's model folder.")
         }
@@ -316,15 +231,61 @@ actor PrivateAIIntegrationService {
     }
 
     func unloadAndRemoveInstalledModel(_ model: PrivateAIRegisteredModel, reason: String) async throws {
-        await self.unloadCachedRuntime(reason: reason)
-        try Self.removeInstalledModel(model)
+        if await MeetingModelResidencyCoordinator.shared.isExclusive {
+            await MeetingModelResidencyCoordinator.shared.vetoRestoration(owner: "fluid")
+            throw MeetingModelResidencyError.busy
+        }
+        try await Self.modelActivity(modelID: model.id) {
+            await Self.provider.unloadCachedRuntime(reason: reason)
+            try Self.removeInstalledModel(model)
+        }
     }
 
     nonisolated static func prepareModel(
         _ model: PrivateAIRegisteredModel,
         progressHandler: PrivateAIModelDownloadProgressHandler? = nil
     ) async throws -> URL {
-        try await self.provider.prepareModel(model, progressHandler: progressHandler)
+        defer { self.invalidateInstalledModelCache() }
+        return try await self.modelActivity(modelID: model.id) { try await self.provider.prepareModel(model, progressHandler: progressHandler) }
+    }
+
+    nonisolated static func modelUpdateStatus(
+        _ model: PrivateAIRegisteredModel
+    ) async -> PrivateAIModelUpdateStatus {
+        await self.provider.modelUpdateStatus(model)
+    }
+
+    nonisolated static func updateModel(
+        _ model: PrivateAIRegisteredModel,
+        progressHandler: PrivateAIModelDownloadProgressHandler? = nil
+    ) async throws -> PrivateAIModelUpdateToken {
+        // Installation, verification and commit/rollback are one transaction. Do not let a
+        // meeting snapshot the temporary runtime between those settings-controller callbacks.
+        let admission = try await MeetingModelResidencyCoordinator.shared.beginOperation(owner: "fluid", modelID: model.id)
+        do {
+            let token = try await Self.modelActivity(modelID: model.id) { try await self.provider.updateModel(model, progressHandler: progressHandler) }
+            await MainActor.run { Self.updateAdmissions[token.id] = admission }
+            return token
+        } catch {
+            await MeetingModelResidencyCoordinator.shared.endOperation(admission)
+            throw error
+        }
+    }
+
+    @MainActor private static var updateAdmissions: [UUID: UUID] = [:]
+
+    nonisolated static func commitModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        defer { self.invalidateInstalledModelCache() }
+        guard let admission = await MainActor.run(body: { Self.updateAdmissions.removeValue(forKey: token.id) }) else { return }
+        await self.provider.commitModelUpdate(token)
+        await MeetingModelResidencyCoordinator.shared.endOperation(admission)
+    }
+
+    nonisolated static func rollbackModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        defer { self.invalidateInstalledModelCache() }
+        guard let admission = await MainActor.run(body: { Self.updateAdmissions.removeValue(forKey: token.id) }) else { return }
+        await self.provider.rollbackModelUpdate(token)
+        await MeetingModelResidencyCoordinator.shared.endOperation(admission)
     }
 
     nonisolated static var isLocalRuntimeConfigured: Bool {
@@ -335,21 +296,74 @@ actor PrivateAIIntegrationService {
         self.provider.shouldHandleDictation(model: model)
     }
 
+    nonisolated static func readsDictationContext(model: String) -> Bool {
+        self.provider.readsDictationContext(model: model)
+    }
+
     func status(for runtime: RuntimeConfiguration) async -> PrivateAIStatus {
-        await Self.provider.status(for: runtime)
+        do { return try await Self.modelActivity { await Self.provider.status(for: runtime) } } catch { return PrivateAIStatus(state: .failed, message: error.localizedDescription) }
+    }
+
+    @MainActor
+    static func meetingResidencyParticipant() -> MeetingModelParticipant {
+        MeetingModelParticipant(
+            owner: "fluid",
+            snapshot: { try await Self.provider.residencySnapshot() },
+            suspend: {
+                await Self.idleUnloader.suspendForMeeting()
+                await Self.provider.unloadCachedRuntime(reason: "meeting processing")
+                await Self.postRuntimeDidChange()
+            },
+            restore: { model in
+                try await Self.modelActivity(modelID: model.id) {
+                    try await Self.provider.restoreResidency(model)
+                }
+            },
+            finish: { await Self.idleUnloader.resumeAfterMeeting() }
+        )
+    }
+
+    private nonisolated static func modelActivity<T: Sendable>(
+        modelID: String? = nil, _ work: () async throws -> T
+    ) async throws -> T {
+        try await MeetingModelResidencyCoordinator.ordinary(owner: "fluid", modelID: modelID ?? self.configuredModelID) {
+            try await Self.idleUnloader.tracking(work)
+        }
     }
 
     func loadedModelState() async -> LoadedModelState? {
         await Self.provider.loadedModelState()
     }
 
-    func loadModel(_ model: PrivateAIRegisteredModel) async throws -> PrivateAIStatus {
-        let status = try await Self.provider.loadModel(model)
-        guard status.state == .ready else { return status }
+    /// Experimental: gives the model's memory back after a quiet period. The
+    /// next dictation reloads it while the user is still speaking.
+    nonisolated static let idleUnloader = PrivateAIIdleUnloader(
+        delay: { await MainActor.run { SettingsStore.shared.privateAIIdleUnloadDelay } },
+        isBusy: { await MainActor.run { AppServices.shared.asr.isRunningOrStarting } },
+        unload: { await PrivateAIIntegrationService.shared.unloadCachedRuntime(reason: "idle") },
+        activityEnded: { await PrivateAIIntegrationService.postRuntimeDidChange() }
+    )
 
-        guard !PrivateAIMLXUpgradeCoordinator.isUpgradePending() else { return status }
-        await self.removeInactiveInstalledModels(keeping: model)
-        return status
+    /// Posted whenever the model may have entered or left memory, so Settings can show
+    /// "Active" for exactly as long as the model is loaded.
+    nonisolated static let runtimeDidChangeNotification = Notification.Name("PrivateAIRuntimeDidChange")
+
+    nonisolated static func postRuntimeDidChange() async {
+        await MainActor.run {
+            NotificationCenter.default.post(name: Self.runtimeDidChangeNotification, object: nil)
+        }
+    }
+
+    func loadModel(_ model: PrivateAIRegisteredModel) async throws -> PrivateAIStatus {
+        try await Self.modelActivity(modelID: model.id) {
+            let status = try await Self.provider.loadModel(model)
+            if status.state == .ready { await self.removeInactiveInstalledModels(keeping: model) }
+            return status
+        }
+    }
+
+    func verifyModel(_ model: PrivateAIRegisteredModel) async throws -> PrivateAIStatus {
+        try await Self.modelActivity(modelID: model.id) { try await Self.provider.verifyModel(model) }
     }
 
     func removeInactiveInstalledModels(keeping model: PrivateAIRegisteredModel) async {
@@ -375,42 +389,71 @@ actor PrivateAIIntegrationService {
     }
 
     func prewarmDictation() async {
-        await Self.provider.prewarmDictation()
+        guard !Task.isCancelled else { return }
+        _ = try? await Self.modelActivity { await Self.provider.prewarmDictation() }
+    }
+
+    func prewarmEdit() async {
+        guard !Task.isCancelled, let model = Self.editModel else { return }
+        _ = try? await Self.modelActivity(modelID: model.id) { await Self.provider.prewarmEdit() }
     }
 
     func unloadCachedRuntime(reason: String = "manual") async {
+        let token: UUID
+        do {
+            guard let admitted = try await MeetingModelResidencyCoordinator.shared.vetoOrBeginOperation(
+                owner: "fluid", modelID: Self.configuredModelID, vetoDuringMeeting: reason != "idle"
+            ) else { return }
+            token = admitted
+        } catch { return }
         await Self.provider.unloadCachedRuntime(reason: reason)
+        await MeetingModelResidencyCoordinator.shared.endOperation(token)
+        await Self.postRuntimeDidChange()
     }
 
     func shutdownForTermination() async {
+        await MeetingModelResidencyCoordinator.shared.beginTermination()
         await Self.provider.shutdownForTermination()
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(inputText, runtime: runtime, context: context)
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await Self.modelActivity {
+            try await self.dictationProvider.enhanceDictation(
+                inputText,
+                runtime: runtime,
+                context: context,
+                maxOutputTokens: budget.maxOutputTokens
+            )
+        }
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext,
         streamHandler: PrivateAIStreamHandler?
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(
-            inputText,
-            runtime: runtime,
-            context: context,
-            streamHandler: streamHandler
-        )
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await Self.modelActivity {
+            try await self.dictationProvider.enhanceDictation(
+                inputText,
+                runtime: runtime,
+                context: context,
+                maxOutputTokens: budget.maxOutputTokens,
+                streamHandler: streamHandler
+            )
+        }
     }
 
-    private nonisolated static func validateDictationHeadroom(_ inputText: String, contextTokenLimit: Int) throws {
+    private nonisolated static func validatedDictationBudget(
+        _ inputText: String,
+        contextTokenLimit: Int
+    ) throws -> SettingsStore.PrivateAIDictationTokenBudget {
         let budget = SettingsStore.privateAIDictationTokenBudget(
             forInputText: inputText,
             contextTokenLimit: contextTokenLimit
@@ -418,6 +461,7 @@ actor PrivateAIIntegrationService {
         guard budget.hasSufficientHeadroom else {
             throw AIProcessingError.dictationExceedsAIContextWindow
         }
+        return budget
     }
 
     func rewrite(
@@ -426,12 +470,14 @@ actor PrivateAIIntegrationService {
         runtime: RuntimeConfiguration,
         context: AppContext
     ) async throws -> EnhancementResult {
-        try await Self.provider.rewrite(
-            inputText,
-            systemPrompt: systemPrompt,
-            runtime: runtime,
-            context: context
-        )
+        try await Self.modelActivity(modelID: runtime.model) {
+            try await Self.provider.rewrite(
+                inputText,
+                systemPrompt: systemPrompt,
+                runtime: runtime,
+                context: context
+            )
+        }
     }
 }
 
@@ -494,15 +540,45 @@ private struct UnavailableAIIntegrationShim: PrivateAIIntegrationProviding {
 
     func unloadCachedRuntime(reason _: String) async {}
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime _: PrivateAIIntegrationService.RuntimeConfiguration,
-        context _: PrivateAIIntegrationService.AppContext
+        context _: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens _: Int
     ) async throws -> PrivateAIIntegrationService.EnhancementResult {
         PrivateAIIntegrationService.EnhancementResult(
             outputText: inputText,
             backendKind: nil,
             latencyMilliseconds: nil
+        )
+    }
+}
+
+// Accept the current provider bridge's name without changing existing callers or stored settings.
+extension PrivateAIIntegrationService.RuntimeConfiguration {
+    var usesBoost: Bool { self.usesFluid1Boost }
+
+    init(
+        selectedProviderID: String,
+        providerKey: String,
+        baseURL: String,
+        model: String,
+        apiKey: String,
+        localModelPath: String?,
+        usesStablePromptPrefixKVCache: Bool,
+        usesBoost: Bool,
+        contextTokenLimit: Int
+    ) {
+        self.init(
+            selectedProviderID: selectedProviderID,
+            providerKey: providerKey,
+            baseURL: baseURL,
+            model: model,
+            apiKey: apiKey,
+            localModelPath: localModelPath,
+            usesStablePromptPrefixKVCache: usesStablePromptPrefixKVCache,
+            usesFluid1Boost: usesBoost,
+            contextTokenLimit: contextTokenLimit
         )
     }
 }

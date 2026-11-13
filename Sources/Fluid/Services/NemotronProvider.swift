@@ -38,7 +38,7 @@ final class NemotronProvider: TranscriptionProvider {
 
     private let repositoryOwner = "BarathwajAnandan"
     private let repositoryRevision = "main"
-    static let requiredFiles = [
+    nonisolated static let requiredFiles = [
         "metadata.json",
         "preprocessor.mlpackage",
         "encoder.mlpackage",
@@ -79,7 +79,7 @@ final class NemotronProvider: TranscriptionProvider {
         return Self.artifactsAreComplete(at: dir)
     }
 
-    static func artifactsAreComplete(at directory: URL) -> Bool {
+    nonisolated static func artifactsAreComplete(at directory: URL) -> Bool {
         guard HuggingFaceModelDownloader.artifactsAreComplete(
             root: directory,
             items: self.requiredFiles.map {
@@ -279,6 +279,13 @@ final class NemotronProvider: TranscriptionProvider {
             throw Self.makeError("Nemotron provider is not ready.")
         }
 
+        return try await self.transcribeFile(at: fileURL, transcribeChunk: self.transcribeSinglePass)
+    }
+
+    func transcribeFile(
+        at fileURL: URL,
+        transcribeChunk: ([Float]) async throws -> String
+    ) async throws -> ASRTranscriptionResult {
         let audioFile = try AVAudioFile(forReading: fileURL)
         let sourceFormat = audioFile.processingFormat
         let targetSampleRate = 16_000.0
@@ -305,7 +312,7 @@ final class NemotronProvider: TranscriptionProvider {
             ))
             while pendingSamples.count > self.maxTranscriptionSamples {
                 let end = self.chunkEnd(in: pendingSamples, offset: 0)
-                let text = try await self.transcribeSinglePass(Array(pendingSamples[..<end]))
+                let text = try await transcribeChunk(Array(pendingSamples[..<end]))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if text.isEmpty == false {
                     transcriptions.append(text)
@@ -315,9 +322,12 @@ final class NemotronProvider: TranscriptionProvider {
             currentFrame += AVAudioFramePosition(framesToRead)
         }
 
-        if pendingSamples.count >= Int(targetSampleRate) {
-            let result = try await self.transcribeBatched(pendingSamples)
-            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if pendingSamples.isEmpty == false {
+            if pendingSamples.count < self.minimumFinalChunkSamples {
+                pendingSamples.append(contentsOf: repeatElement(Float(0), count: self.minimumFinalChunkSamples - pendingSamples.count))
+            }
+            let text = try await transcribeChunk(pendingSamples)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty == false {
                 transcriptions.append(text)
             }
@@ -331,15 +341,17 @@ final class NemotronProvider: TranscriptionProvider {
         if let manager = self.manager {
             await self.stopComponentProfilingIfNeeded(on: manager)
         }
-        if let dir = self.cacheDirectory {
-            if FileManager.default.fileExists(atPath: dir.path) {
-                try FileManager.default.removeItem(at: dir)
-            }
-        }
         self.manager = nil
         self.isReady = false
         self.streamedSampleCount = 0
         self.activeLanguageCode = nil
+        if let directory = self.cacheDirectory {
+            try await Task.detached(priority: .userInitiated) {
+                if FileManager.default.fileExists(atPath: directory.path) {
+                    try FileManager.default.removeItem(at: directory)
+                }
+            }.value
+        }
     }
 
     private func transcribeBatched(_ samples: [Float]) async throws -> ASRTranscriptionResult {

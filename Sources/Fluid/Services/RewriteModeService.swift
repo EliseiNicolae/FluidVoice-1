@@ -11,8 +11,20 @@ final class RewriteModeService: ObservableObject {
     @Published var streamingThinkingText: String = "" // Real-time thinking tokens for UI
     @Published var isProcessing = false
     @Published var conversationHistory: [Message] = []
+    /// Why the last request produced nothing, for the overlay to show.
+    @Published private(set) var lastErrorMessage: String?
     @Published var isWriteMode: Bool = false // true = no text selected (write/improve), false = text selected (rewrite)
     private var promptAppBundleID: String?
+    /// The front window as read when the shortcut was pressed.
+    private var windowCapture: DictationContextCapture?
+    private var windowCaptureRevision: UInt64?
+    private let captureWindow: @MainActor (TypingService.RecordingTargetContext) -> DictationContextCapture?
+
+    init(captureWindow: @escaping @MainActor (TypingService.RecordingTargetContext) -> DictationContextCapture? = {
+        DictationContextCapture.startForEditMode(target: $0)
+    }) {
+        self.captureWindow = captureWindow
+    }
 
     private let textSelectionService = TextSelectionService.shared
     private let typingService = TypingService()
@@ -82,7 +94,14 @@ final class RewriteModeService: ObservableObject {
     }
 
     func processRewriteRequest(_ prompt: String) async {
+        guard let summaryActivity = MeetingSummaryActivityCoordinator.shared.beginProcessing() else {
+            MeetingSummaryActivityCoordinator.presentBusyError()
+            return
+        }
+        defer { MeetingSummaryActivityCoordinator.shared.endProcessing(summaryActivity) }
+
         let startTime = Date()
+        self.lastErrorMessage = nil
         AnalyticsService.shared.recordUsage(
             mode: .edit,
             aiModel: SettingsStore.shared.analyticsAIModelDescriptor(for: .edit)
@@ -129,7 +148,7 @@ final class RewriteModeService: ObservableObject {
         self.isProcessing = true
 
         do {
-            let response = try await callLLM(messages: conversationHistory, isWriteMode: isWriteMode)
+            let response = try await callLLM(messages: conversationHistory, isWriteMode: isWriteMode, instruction: prompt)
             self.conversationHistory.append(Message(role: .assistant, content: response))
             self.rewrittenText = response
             self.isProcessing = false
@@ -139,6 +158,7 @@ final class RewriteModeService: ObservableObject {
 
         } catch {
             self.conversationHistory.append(Message(role: .assistant, content: "Error: \(error.localizedDescription)"))
+            self.lastErrorMessage = error.localizedDescription
             self.isProcessing = false
             self.appendDiagnosticLog(
                 "processRewriteRequest failure | writeMode=\(self.isWriteMode) | error=\(error.localizedDescription)"
@@ -146,10 +166,29 @@ final class RewriteModeService: ObservableObject {
         }
     }
 
-    func acceptRewrite() {
-        guard !self.rewrittenText.isEmpty else { return }
-        NSApp.hide(nil) // Restore focus to the previous app
-        self.typingService.typeTextInstantly(self.rewrittenText)
+    @MainActor
+    func acceptRewrite(_ text: String) async {
+        guard let summaryActivity = MeetingSummaryActivityCoordinator.shared.beginProcessing() else {
+            MeetingSummaryActivityCoordinator.presentBusyError()
+            return
+        }
+        defer { MeetingSummaryActivityCoordinator.shared.endProcessing(summaryActivity) }
+
+        // The panel may clear its state before this queued action starts.
+        guard !text.isEmpty else { return }
+        NSApp.hide(nil)
+        // Hiding alone races the paste: the focused element can still be our
+        // panel when the editability check runs. Put focus back on the field
+        // the rewrite was recorded from, and fall back to a short settle.
+        var targetPID: pid_t?
+        if let context = NotchContentState.shared.recordingTargetContext {
+            let preparation = await TypingService.prepareTargetForDelivery(context)
+            targetPID = context.pid
+            self.appendDiagnosticLog("acceptRewrite focus=\(preparation.rawValue) pid=\(context.pid)")
+        } else {
+            try? await Task.sleep(nanoseconds: 80_000_000)
+        }
+        _ = await self.typingService.typeTextInstantly(text, preferredTargetPID: targetPID)
     }
 
     func clearState() {
@@ -161,6 +200,41 @@ final class RewriteModeService: ObservableObject {
         self.isWriteMode = false
         self.thinkingBuffer = []
         self.promptAppBundleID = nil
+        self.lastErrorMessage = nil
+        self.stopReadingWindow()
+    }
+
+    /// Starts reading the window while it is still in front, so the answer can use
+    /// what the user is looking at. Replaces the reading of any earlier press.
+    func startReadingWindow(target: TypingService.RecordingTargetContext) {
+        self.stopReadingWindow()
+        guard SettingsStore.shared.editModeReadsScreen else { return }
+        self.windowCaptureRevision = SettingsStore.shared.editModeScreenContextRevision
+        self.windowCapture = self.captureWindow(target)
+    }
+
+    func windowContextForRewrite() async -> DictationTypingContext? {
+        self.cancelOutdatedWindowCapture()
+        guard let capture = self.windowCapture, let revision = self.windowCaptureRevision else { return nil }
+        let context = await capture.result(timeout: .seconds(2))
+        // The switch or target may change while the window reader is pending.
+        guard !Task.isCancelled, SettingsStore.shared.editModeReadsScreen,
+              revision == SettingsStore.shared.editModeScreenContextRevision,
+              self.windowCapture === capture
+        else { return nil }
+        return context
+    }
+
+    func cancelOutdatedWindowCapture() {
+        if !SettingsStore.shared.editModeReadsScreen || self.windowCaptureRevision != SettingsStore.shared.editModeScreenContextRevision {
+            self.stopReadingWindow()
+        }
+    }
+
+    func stopReadingWindow() {
+        self.windowCapture?.cancel()
+        self.windowCapture = nil
+        self.windowCaptureRevision = nil
     }
 
     func setPromptAppBundleID(_ bundleID: String?) {
@@ -170,7 +244,7 @@ final class RewriteModeService: ObservableObject {
 
     // MARK: - LLM Integration
 
-    private func callLLM(messages: [Message], isWriteMode: Bool) async throws -> String {
+    private func callLLM(messages: [Message], isWriteMode: Bool, instruction: String) async throws -> String {
         let settings = SettingsStore.shared
         let promptMode: SettingsStore.PromptMode = .edit
         let appBundleID = self.promptAppBundleID
@@ -185,12 +259,7 @@ final class RewriteModeService: ObservableObject {
         let builtInDefaultPrompt = SettingsStore.defaultSystemPromptText(for: promptMode)
         let systemPromptBeforeContext = settings.effectiveSystemPrompt(for: promptMode, appBundleID: appBundleID)
         // Use global provider/model when linked, otherwise use Edit Mode's independent settings.
-        let providerID: String = {
-            if settings.rewriteModeLinkedToGlobal {
-                return settings.selectedProviderID
-            }
-            return settings.rewriteModeSelectedProviderID
-        }()
+        let providerID = settings.effectiveRewriteModeProviderID
         guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(
                 domain: "RewriteMode",
@@ -235,25 +304,7 @@ final class RewriteModeService: ObservableObject {
             self.logPromptTrace("Conversation input (Q/history)", value: messageDump.isEmpty ? "<empty>" : messageDump)
         }
 
-        let model: String = {
-            if settings.rewriteModeLinkedToGlobal {
-                let key: String
-                if ModelRepository.shared.isBuiltIn(providerID) {
-                    key = providerID
-                } else if providerID.hasPrefix("custom:") {
-                    key = providerID
-                } else {
-                    key = "custom:\(providerID)"
-                }
-                return settings.selectedModelByProvider[key]
-                    ?? settings.selectedModel
-                    ?? ModelRepository.shared.defaultModels(for: providerID).first
-                    ?? ""
-            }
-            return settings.rewriteModeSelectedModel
-                ?? ModelRepository.shared.defaultModels(for: providerID).first
-                ?? ""
-        }()
+        let model = settings.effectiveRewriteModeSelectedModel
         guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(
                 domain: "RewriteMode",
@@ -264,18 +315,18 @@ final class RewriteModeService: ObservableObject {
         var runtimeModel = model
         var localModelPath = PrivateAIIntegrationService.configuredLocalModelPath
         if usesPrivateAIProvider {
-            guard let verifiedModelID = PrivateAIProviderPromptFormat.verifiedModelID(for: model, settings: settings),
-                  let verifiedModel = PrivateAIModelRegistry.model(id: verifiedModelID),
-                  let verifiedModelPath = PrivateAIIntegrationService.localModelPath(for: verifiedModel)
+            let route = EditModeRoute.current(providerID: providerID)
+            guard case let .local(editModel) = route,
+                  let editModelPath = PrivateAIIntegrationService.localModelPath(for: editModel)
             else {
                 throw NSError(
                     domain: "RewriteMode",
                     code: -5,
-                    userInfo: [NSLocalizedDescriptionKey: "Selected Fluid-1 model is not installed and verified"]
+                    userInfo: [NSLocalizedDescriptionKey: route.failureMessage ?? EditModeRoute.modelMissing.failureMessage ?? ""]
                 )
             }
-            runtimeModel = verifiedModelID
-            localModelPath = verifiedModelPath
+            runtimeModel = editModel.id
+            localModelPath = editModelPath
         }
         self.appendDiagnosticLog(
             "LLM config | writeMode=\(isWriteMode) | linkedToGlobal=\(settings.rewriteModeLinkedToGlobal) | " +
@@ -294,12 +345,16 @@ final class RewriteModeService: ObservableObject {
         }
 
         if usesPrivateAIProvider || PrivateAIIntegrationService.shouldHandleDictation(model: model) {
-            let inputText = messages.map {
-                let role = $0.role == .user ? "user" : "assistant"
-                return "[\(role)]\n\($0.content)"
-            }.joined(separator: "\n\n")
+            // A follow-up applies to the last result, not to the original selection.
+            let textToEdit = self.rewrittenText.isEmpty ? self.selectedContextText : self.rewrittenText
+            let window = await self.windowContextForRewrite()
+            // Counts only: what was read is never logged.
+            DebugLogger.shared.info(
+                "Edit Mode read the window | lines=\(window?.windowLines?.count ?? 0) | hasSelection=\(!textToEdit.isEmpty)",
+                source: "RewriteModeService"
+            )
             let response = try await PrivateAIIntegrationService.shared.rewrite(
-                inputText,
+                instruction,
                 systemPrompt: systemPrompt,
                 runtime: PrivateAIIntegrationService.RuntimeConfiguration(
                     selectedProviderID: providerID,
@@ -316,7 +371,10 @@ final class RewriteModeService: ObservableObject {
                     appName: "",
                     bundleID: appBundleID ?? "",
                     windowTitle: "",
-                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+                    selectedText: textToEdit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : textToEdit,
+                    windowLines: window?.windowLines,
+                    userDisplayName: NSFullUserName()
                 )
             )
             return response.outputText
@@ -337,7 +395,7 @@ final class RewriteModeService: ObservableObject {
 
         // Reasoning models (o1, o3, gpt-5) don't support temperature parameter at all
         let isReasoningModel = settings.isReasoningModel(model)
-        let isTemperatureUnsupported = settings.isTemperatureUnsupported(model)
+        let isTemperatureUnsupported = settings.isTemperatureUnsupported(model, baseURL: baseURL)
 
         // Get reasoning config for this model (e.g., reasoning_effort, enable_thinking)
         let reasoningConfig = settings.getReasoningConfig(forModel: model, provider: providerID)
@@ -426,9 +484,7 @@ final class RewriteModeService: ObservableObject {
 
     private func appendDiagnosticLog(_ message: String) {
         guard self.diagnosticsEnabled || self.forcePromptTraceToConsole else { return }
-        let line = "[RewriteModeService] \(message)"
-        FileLogger.shared.append(line: line)
-        DebugLogger.shared.debug(line, source: "RewriteModeService")
+        DebugLogger.shared.info(message, source: "RewriteModeService")
     }
 
     private func providerKey(for providerID: String) -> String {

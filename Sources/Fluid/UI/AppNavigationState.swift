@@ -11,7 +11,9 @@ enum SidebarItem: Hashable {
     case welcome
     case voiceEngine
     case aiEnhancements
-    case meetingTools
+    case cleanupStyles
+    case fileTranscription
+    case meetingTranscription
     case customDictionary
     case stats
     case history
@@ -19,15 +21,48 @@ enum SidebarItem: Hashable {
     case feedback
     case commandMode
     case rewriteMode
+
+    var title: String {
+        switch self {
+        case .welcome: "Dashboard"
+        case .voiceEngine: "Voice Engine"
+        case .aiEnhancements: "AI Settings"
+        case .cleanupStyles: "Cleanup Styles"
+        case .fileTranscription: "File Transcription"
+        case .meetingTranscription: "FluidMeet"
+        case .customDictionary: "Custom Dictionary"
+        case .stats: "Stats"
+        case .history: "History"
+        case .changelog: "Change logs"
+        case .feedback: "Feedback"
+        case .commandMode: "Command Mode"
+        case .rewriteMode: "Edit Mode"
+        }
+    }
+}
+
+/// Read-only projection; changing chrome cannot navigate or alter a page's state.
+struct AppPagePresentation: Equatable {
+    let title: String
+    let showsPageActions: Bool
+
+    init(destination: SidebarItem?, settings: SettingsNavigationState) {
+        self.title = settings.selectedSection?.title ?? (destination ?? .welcome).title
+        self.showsPageActions = !settings.isPresented
+    }
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
     case general
+    case fluidMeet
     case dictation
+    case dictationFormatting
+    case shortcuts
     case notifications
     case audio
     case overlay
     case dataAndDiagnostics
+    case experimental
 
     var id: Self {
         self
@@ -36,22 +71,30 @@ enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
     var title: String {
         switch self {
         case .general: return "General"
+        case .fluidMeet: return "FluidMeet Settings"
         case .dictation: return "Dictation"
+        case .dictationFormatting: return "Dictation Formatting"
+        case .shortcuts: return "Shortcuts"
         case .notifications: return "Notifications"
         case .audio: return "Audio"
         case .overlay: return "Overlay"
         case .dataAndDiagnostics: return "Data & Diagnostics"
+        case .experimental: return "Experimental"
         }
     }
 
     var systemImage: String {
         switch self {
         case .general: return "gearshape"
-        case .dictation: return "keyboard"
+        case .fluidMeet: return "person.2"
+        case .dictation: return "mic"
+        case .dictationFormatting: return "textformat"
+        case .shortcuts: return "keyboard"
         case .notifications: return "bell"
         case .audio: return "speaker.wave.2"
         case .overlay: return "rectangle.on.rectangle"
         case .dataAndDiagnostics: return "wrench.and.screwdriver"
+        case .experimental: return "flask"
         }
     }
 }

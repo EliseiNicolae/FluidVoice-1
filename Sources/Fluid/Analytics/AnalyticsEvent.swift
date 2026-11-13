@@ -5,6 +5,7 @@ enum AnalyticsEvent: String {
     case activeUser = "active_user"
     case usageDailySummary = "usage_daily_summary"
     case modelUsageDailySummary = "model_usage_daily_summary"
+    case insertionLatencyDailySummary = "insertion_latency_daily_summary"
     case onboardingStarted = "onboarding_started"
     case onboardingStepViewed = "onboarding_step_viewed"
     case onboardingStepCompleted = "onboarding_step_completed"
@@ -12,6 +13,44 @@ enum AnalyticsEvent: String {
     case onboardingTryoutFinished = "onboarding_tryout_finished"
     case modelDownloadStarted = "model_download_started"
     case modelDownloadFinished = "model_download_finished"
+    case dictationPerformanceDailySummary = "dictation_performance_daily_summary"
+}
+
+enum AnalyticsBuildPolicy {
+    // Release artifacts identify the beta cohort in their installed version
+    // (e.g. 1.6.10-beta.1). The updater preference only selects future updates;
+    // enabling it on a stable installation must not turn on beta telemetry.
+    static func automaticallyCollectsDictationPerformance(appVersion: String) -> Bool {
+        appVersion
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .contains("beta")
+    }
+}
+
+enum DictationPerformanceLogSummary {
+    static func line(
+        asrMilliseconds: Int?,
+        aiMilliseconds: Int?,
+        readyMilliseconds: Int,
+        outcome: String
+    ) -> String {
+        let asr = asrMilliseconds ?? -1
+        let ai = aiMilliseconds ?? -1
+        let measured = max(asr, 0) + max(ai, 0)
+        let appOverhead = max(readyMilliseconds - measured, 0)
+        let slowest: String
+        if ai >= asr, ai >= appOverhead, ai >= 0 {
+            slowest = "ai"
+        } else if asr >= appOverhead, asr >= 0 {
+            slowest = "asr"
+        } else {
+            slowest = "app_overhead"
+        }
+        return "DICTATION_SUMMARY asrMs=\(asr) aiMs=\(ai) "
+            + "appOverheadMs=\(appOverhead) readyMs=\(readyMilliseconds) "
+            + "slowest=\(slowest) outcome=\(outcome)"
+    }
 }
 
 enum AnalyticsActivityKind: String {
@@ -29,6 +68,43 @@ enum AnalyticsUsageMode: String {
 enum AnalyticsModelRole: String {
     case transcription
     case aiPostProcessing = "ai_post_processing"
+}
+
+enum AnalyticsFluidIntelligenceModel: String {
+    case pico
+    case mini
+
+    init?(modelID: String?) {
+        guard let modelID else { return nil }
+        switch modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "fluid-1-pico-96k-dflash":
+            self = .pico
+        case "fluid-1-mini-96k-dflash":
+            self = .mini
+        default:
+            return nil
+        }
+    }
+}
+
+enum AnalyticsInsertionPath: String {
+    case clipboard
+    case direct
+    case clipboardFallback = "clipboard_fallback"
+    case notAttempted = "not_attempted"
+}
+
+enum AnalyticsInsertionOutcome: String {
+    case dispatched
+    case emptyText = "empty_text"
+    case accessibilityNotTrusted = "accessibility_not_trusted"
+    case clipboardSnapshotFailed = "clipboard_snapshot_failed"
+    case clipboardWriteFailed = "clipboard_write_failed"
+    case pasteCommandFailed = "paste_command_failed"
+    case targetUnavailable = "target_unavailable"
+    case targetRestoreFailed = "target_restore_failed"
+    case noEditableTarget = "no_editable_target"
+    case pasteNotLanded = "paste_not_landed"
 }
 
 struct AnalyticsModelDescriptor: Equatable {
@@ -67,7 +143,6 @@ enum AnalyticsOnboardingOutcome: String {
     case continued
     case skipped
     case completed
-    case openedSettings = "opened_settings"
 }
 
 enum AnalyticsOnboardingTryoutOutcome: String {
